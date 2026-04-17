@@ -1,0 +1,5 @@
+# A5: Deterministic Neural ODE (set σ_θ = 0)
+# Tests whether stochastic modeling is necessary
+sde:
+  ablation: "deterministic_ode"
+  lambda_sigma: 0.0  # No diffusion matching

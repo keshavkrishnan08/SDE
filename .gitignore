@@ -1,0 +1,61 @@
+# Data directories (too large for GitHub — notebooks re-download from NREL)
+data/raw/
+data/processed/
+data/metadata/
+
+# Model checkpoints and training outputs
+outputs/checkpoints/
+outputs/logs/
+outputs/results/*.csv
+*.pt
+*.pth
+*.ckpt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/*.toc
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+
+# Jupyter checkpoints
+*.ipynb_checkpoints
+
+# Weights & Biases
+wandb/
+
+# Temporary files
+*.tmp
+*.bak
+*.old
+tool-results/
