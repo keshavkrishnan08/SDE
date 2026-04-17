@@ -1,0 +1,5 @@
+# A3: SolarSDE without CS-VAE (raw pixels)
+# Neural SDE operates on PCA-reduced pixel features instead of learned latent space
+vae:
+  ablation: "no_vae"
+  latent_dim: 64  # PCA dimension instead of VAE

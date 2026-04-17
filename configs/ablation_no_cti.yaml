@@ -1,0 +1,6 @@
+# A2: SolarSDE without CTI gating
+# σ_θ(z_t) without CTI conditioning — tests whether CTI gating is necessary
+sde:
+  diffusion_hidden: 64
+  # Override: CTI dimension set to 0, diffusion is free (unconditioned)
+  ablation: "no_cti"

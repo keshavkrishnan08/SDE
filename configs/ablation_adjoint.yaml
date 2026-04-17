@@ -1,0 +1,5 @@
+# A6: Adjoint sensitivity training instead of SDE Matching
+# Tests whether SDE Matching training is necessary for performance
+sde:
+  ablation: "adjoint_training"
+  training_method: "adjoint"

@@ -1,0 +1,5 @@
+# A7: No meteorological covariates
+# Remove c_t from drift network — tests whether meteo features help beyond imagery
+sde:
+  covariate_dim: 0
+  ablation: "no_meteo"

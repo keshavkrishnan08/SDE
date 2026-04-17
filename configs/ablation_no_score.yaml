@@ -1,0 +1,5 @@
+# A4: SolarSDE without Score Matching decoder
+# Replace CSMID with linear decoder z → GHI
+score:
+  ablation: "linear_decoder"
+  hidden_dim: 256
