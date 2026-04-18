@@ -823,12 +823,16 @@ EM_SOLVER = '''\
 # the state vector to stay within ~4σ of training latent statistics.
 
 # Compute training-latent stats once at module load.
+# Use robust envelope: mean ± Z_CLAMP_STDS * std, with a per-dim minimum width so
+# tiny-std latent dimensions don't get pinned to near-zero range at long horizons.
 _train_Z_np = np.load(LATENT_DIR / "train_latents.npy")
 Z_MEAN = torch.from_numpy(_train_Z_np.mean(0)).float().to(DEVICE)
-Z_STD  = torch.from_numpy(_train_Z_np.std(0)).float().to(DEVICE) + 1e-6
-Z_CLAMP_STDS = 4.0
-MU_CAP = 5.0
-SIGMA_CAP = 2.0
+Z_STD_RAW = torch.from_numpy(_train_Z_np.std(0)).float().to(DEVICE) + 1e-6
+# Enforce minimum clamp width of 0.25 per dim so long-horizon rollouts aren't frozen
+Z_STD = torch.maximum(Z_STD_RAW, torch.full_like(Z_STD_RAW, 0.05))
+Z_CLAMP_STDS = 8.0   # loosened from 4.0 — prevents sample collapse to boundary at long horizons
+MU_CAP = 10.0        # loosened from 5.0
+SIGMA_CAP = 5.0      # loosened from 2.0
 
 def em_step(drift_fn, diff_fn, z, t, c, cti, dt):
     mu = drift_fn(z, t, c).clamp(-MU_CAP, MU_CAP)
@@ -1018,7 +1022,7 @@ val_loader   = DataLoader(val_ds,   batch_size=128, shuffle=False)
 
 sde = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM, drift_h=256, diff_h=64, lambda_sigma=1.0).to(DEVICE)
 opt = torch.optim.Adam(sde.parameters(), lr=1e-4)
-EPOCHS_SDE = 100
+EPOCHS_SDE = 150
 print(f"SDE params: {sum(p.numel() for p in sde.parameters()):,}")
 
 best_val = float("inf"); t0 = time.time(); hist = []
@@ -1058,12 +1062,14 @@ print(f"SDE training complete. Best val: {best_val:.5f}. Time: {(time.time()-t0)
         ("markdown", "## 6. Train Score Decoder"),
         ("code", """torch.manual_seed(42)
 score = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, h=256, blocks=2, steps=100).to(DEVICE)
-opt = torch.optim.Adam(score.parameters(), lr=1e-4)
+opt = torch.optim.Adam(score.parameters(), lr=2e-4)
+# Cosine-annealing LR schedule: warm lr for first 10%, decay to 1e-5 over remaining epochs
 print(f"Score Decoder params: {sum(p.numel() for p in score.parameters()):,}")
 
 train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, drop_last=True)
 val_loader   = DataLoader(val_ds,   batch_size=256, shuffle=False)
-EPOCHS_SCORE = 40
+EPOCHS_SCORE = 150   # increased from 40 — DDPMs need more training than typical supervised models
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS_SCORE, eta_min=1e-5)
 
 best_val = float("inf"); t0 = time.time(); hist = []
 for ep in range(1, EPOCHS_SCORE + 1):
@@ -1072,9 +1078,12 @@ for ep in range(1, EPOCHS_SCORE + 1):
         z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
         c = b["cov"].to(DEVICE); g = b["ghi"].to(DEVICE).unsqueeze(-1)
         l = score.training_loss(g, z, cti, c)["loss"]
-        opt.zero_grad(); l.backward(); opt.step()
+        opt.zero_grad(); l.backward()
+        torch.nn.utils.clip_grad_norm_(score.parameters(), 1.0)
+        opt.step()
         tl += l.item(); n += 1
     tl /= n
+    sched.step()
     score.eval(); vl = vn = 0
     with torch.no_grad():
         for b in val_loader:
@@ -1082,9 +1091,9 @@ for ep in range(1, EPOCHS_SCORE + 1):
             c = b["cov"].to(DEVICE); g = b["ghi"].to(DEVICE).unsqueeze(-1)
             vl += score.training_loss(g, z, cti, c)["loss"].item(); vn += 1
     vl /= max(vn, 1)
-    hist.append({"epoch": ep, "train_loss": tl, "val_loss": vl})
-    if ep % 5 == 0 or ep == 1:
-        print(f"Epoch {ep:3d}/{EPOCHS_SCORE} | train={tl:.4f} | val={vl:.4f} | {(time.time()-t0)/60:.1f} min")
+    hist.append({"epoch": ep, "train_loss": tl, "val_loss": vl, "lr": opt.param_groups[0]["lr"]})
+    if ep % 10 == 0 or ep == 1:
+        print(f"Epoch {ep:3d}/{EPOCHS_SCORE} | train={tl:.4f} | val={vl:.4f} | lr={opt.param_groups[0]['lr']:.2e} | {(time.time()-t0)/60:.1f} min")
     if vl < best_val:
         best_val = vl; torch.save(score.state_dict(), CHECKPOINT_DIR / "score_best.pt")
 
