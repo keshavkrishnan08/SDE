@@ -1182,16 +1182,39 @@ def load_split(split):
 data = {s: load_split(s) for s in ["train", "val", "test"]}
 
 # Load splits parquet to get clear_sky_index, ghi_clearsky for Smart Persistence
+SPLITS_DIR = PERSIST_DIR / "splits"
 train_df = pd.read_parquet(SPLITS_DIR / "train.parquet")
 val_df   = pd.read_parquet(SPLITS_DIR / "val.parquet")
 test_df  = pd.read_parquet(SPLITS_DIR / "test.parquet")
+
+# Extended 90-day BMS dataset for training deep baselines (12x more data,
+# no images needed — pulls automatically from GitHub via fast-start below)
+EXTENDED_DIR = PERSIST_DIR / "extended"
+EXTENDED_DIR.mkdir(parents=True, exist_ok=True)
+# Fetch extended parquets if not present
+_extended_files = ["train.parquet", "val.parquet", "test.parquet"]
+if not all((EXTENDED_DIR / f).exists() for f in _extended_files):
+    print("Pulling extended 90-day BMS dataset from GitHub ...")
+    import requests
+    for f in _extended_files:
+        url = f"https://raw.githubusercontent.com/keshavkrishnan08/SDE/main/colab_outputs/extended/{f}"
+        dest = EXTENDED_DIR / f
+        r = requests.get(url, timeout=120)
+        if r.status_code == 200 and len(r.content) > 1000:
+            dest.write_bytes(r.content)
+            print(f"  OK {f}: {len(r.content)/1e6:.2f} MB")
+ext_train = pd.read_parquet(EXTENDED_DIR / "train.parquet")
+ext_val   = pd.read_parquet(EXTENDED_DIR / "val.parquet")
+ext_test  = pd.read_parquet(EXTENDED_DIR / "test.parquet")
+print(f"\\nExtended (90-day BMS): train={len(ext_train):,}  val={len(ext_val):,}  test={len(ext_test):,}")
+print(f"Image (8-day CloudCV):  train={len(train_df):,}  val={len(val_df):,}  test={len(test_df):,}")
 
 HORIZONS = [6, 30, 60, 120, 180]
 HORIZON_MIN = {6: 1, 30: 5, 60: 10, 120: 20, 180: 30}
 N_SAMPLES = 50
 SEQ_LEN = 30
 N_EVAL = min(1000, len(data["test"]["ghi"]) - max(HORIZONS) - 1)
-print(f"Horizons: {list(HORIZON_MIN.values())} min, MC samples: {N_SAMPLES}, Eval points: {N_EVAL}")
+print(f"\\nHorizons: {list(HORIZON_MIN.values())} min, MC samples: {N_SAMPLES}, Eval points: {N_EVAL}")
 """),
         ("markdown", "## 2. Shared metrics + output buffer"),
         ("code", METRICS_CODE),
@@ -1263,7 +1286,7 @@ save_baseline("smart_persistence", res_sp)
 """),
         ("markdown", "## 5. Deterministic LSTM + calibrated Gaussian noise"),
         ("code", """# Build sequence dataset from (GHI, kt, zenith, covariates)
-def build_seq_tensors(df, data_split, seq_len, horizons):
+def build_seq_tensors(df, seq_len, horizons):
     # features: ghi, clear_sky_index, solar_zenith, temperature, humidity, wind_speed
     f_cols = ["ghi", "clear_sky_index", "solar_zenith"]
     for c in ["temperature", "humidity", "wind_speed"]:
@@ -1272,15 +1295,29 @@ def build_seq_tensors(df, data_split, seq_len, horizons):
     ghi = df["ghi"].values.astype(np.float32)
     mx = max(horizons)
     Xs, Ys = [], []
+    # Horizons refer to 10-second steps; extended BMS is 1-min so each step is 6 BMS rows.
+    # We keep horizons as-is since downstream metrics index by step count.
     for i in range(seq_len, len(X_arr) - mx):
         Xs.append(X_arr[i - seq_len:i])
         Ys.append(np.array([ghi[i + h] for h in horizons], dtype=np.float32))
     return torch.tensor(np.stack(Xs)), torch.tensor(np.stack(Ys))
 
-Xtr, Ytr = build_seq_tensors(train_df, data["train"], SEQ_LEN, HORIZONS)
-Xva, Yva = build_seq_tensors(val_df,   data["val"],   SEQ_LEN, HORIZONS)
-Xte, Yte = build_seq_tensors(test_df,  data["test"],  SEQ_LEN, HORIZONS)
-print(f"Seq shapes: train={Xtr.shape}/{Ytr.shape}, val={Xva.shape}, test={Xte.shape}")
+# Deep baselines train on the EXTENDED 90-day BMS dataset (12x more data)
+# but evaluate on the IMAGE test set for apples-to-apples comparison with SolarSDE.
+# Extended BMS is 1-minute resolution vs image 10s — for the baselines we downsample
+# BMS to match image resolution by keeping every 6th BMS row (approximates 10s snapshots).
+def downsample_to_10s(df):
+    return df.iloc[::6].reset_index(drop=True) if len(df) > 0 else df
+
+ext_train_10s = downsample_to_10s(ext_train)
+ext_val_10s   = downsample_to_10s(ext_val)
+
+Xtr, Ytr = build_seq_tensors(ext_train_10s, SEQ_LEN, HORIZONS)
+Xva, Yva = build_seq_tensors(ext_val_10s,   SEQ_LEN, HORIZONS)
+# Test on the IMAGE test set for fair comparison with SolarSDE
+Xte, Yte = build_seq_tensors(test_df, SEQ_LEN, HORIZONS)
+print(f"Baseline seq shapes:  train={Xtr.shape}/{Ytr.shape}  val={Xva.shape}  test={Xte.shape}")
+print(f"  (baselines train on 90-day BMS, evaluate on 8-day image test set)")
 
 # Normalize features based on train stats
 mu_f = Xtr.mean(dim=(0,1), keepdim=True); sd_f = Xtr.std(dim=(0,1), keepdim=True) + 1e-6
