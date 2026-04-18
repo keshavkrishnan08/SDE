@@ -106,6 +106,49 @@ pip_install("pvlib", "properscoring", "pyarrow", "tqdm")
 print("Dependencies installed.")
 """
 
+# Fast-start: downstream notebooks (2-5) can pull trained Notebook 1 outputs
+# straight from GitHub so they don't need to re-run Notebook 1.
+GITHUB_FAST_START = """\
+# ==== Fast-start: fetch Notebook 1 outputs from GitHub if persistent storage is empty ====
+# This lets Notebooks 2-5 run standalone without having re-executed Notebook 1.
+GITHUB_REPO = "https://github.com/keshavkrishnan08/SDE"
+GITHUB_RAW = "https://raw.githubusercontent.com/keshavkrishnan08/SDE/main"
+
+need_nb1_outputs = not (CHECKPOINT_DIR / "vae_best.pt").exists() or not any(LATENT_DIR.glob("train_*.npy"))
+if need_nb1_outputs:
+    print("Notebook 1 outputs not found in persistent storage — pulling from GitHub ...")
+    import requests
+    files_to_pull = [
+        ("checkpoints/vae_best.pt",          CHECKPOINT_DIR / "vae_best.pt"),
+        ("checkpoints/vae_final.pt",         CHECKPOINT_DIR / "vae_final.pt"),
+        ("results/vae_training_history.csv", RESULTS_DIR / "vae_training_history.csv"),
+        ("splits/train.parquet",             PERSIST_DIR / "splits" / "train.parquet"),
+        ("splits/val.parquet",               PERSIST_DIR / "splits" / "val.parquet"),
+        ("splits/test.parquet",              PERSIST_DIR / "splits" / "test.parquet"),
+    ]
+    for split in ["train", "val", "test"]:
+        for k in ["latents", "cti", "ghi", "covariates", "is_ramp"]:
+            files_to_pull.append((f"latents/{split}_{k}.npy", LATENT_DIR / f"{split}_{k}.npy"))
+
+    for rel, dest in files_to_pull:
+        url = f"{GITHUB_RAW}/colab_outputs/{rel}"
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            r = requests.get(url, timeout=120)
+            if r.status_code == 200 and len(r.content) > 100:
+                dest.write_bytes(r.content)
+                print(f"  OK  {rel}  ({len(r.content)/1e6:.2f} MB)")
+            else:
+                print(f"  SKIP {rel}  (status {r.status_code})")
+        except Exception as e:
+            print(f"  FAIL {rel}: {e}")
+    print("Fast-start pull complete.")
+else:
+    print("Notebook 1 outputs already present in persistent storage.")
+"""
+
 GPU_CHECK = """\
 # ==== GPU Check ====
 import torch
@@ -886,6 +929,8 @@ def nb2():
         ("code", INSTALL_DEPS),
         ("code", ENV_SETUP),
         ("code", GPU_CHECK),
+        ("markdown", "## Fast-start — pull Notebook 1 outputs from GitHub (skips VAE retraining)"),
+        ("code", GITHUB_FAST_START),
         ("markdown", "## 1. Load latents from Notebook 1"),
         ("code", """import numpy as np, pandas as pd
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -1100,6 +1145,8 @@ Each baseline is evaluated at the same 5 horizons (1, 5, 10, 20, 30 min) and com
         ("code", INSTALL_DEPS),
         ("code", ENV_SETUP),
         ("code", GPU_CHECK),
+        ("markdown", "## Fast-start — pull Notebook 1 outputs from GitHub (skips VAE retraining)"),
+        ("code", GITHUB_FAST_START),
         ("markdown", "## 1. Load data + config"),
         ("code", """import numpy as np, pandas as pd
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -1539,6 +1586,8 @@ Each ablation re-trains the relevant component(s) and evaluates at the same 5 ho
         ("code", INSTALL_DEPS),
         ("code", ENV_SETUP),
         ("code", GPU_CHECK),
+        ("markdown", "## Fast-start — pull Notebook 1 outputs from GitHub (skips VAE retraining)"),
+        ("code", GITHUB_FAST_START),
         ("code", """import numpy as np, pandas as pd
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -1844,6 +1893,8 @@ def nb5():
         ("code", INSTALL_DEPS),
         ("code", ENV_SETUP),
         ("code", GPU_CHECK),
+        ("markdown", "## Fast-start — pull Notebook 1 outputs from GitHub (skips VAE retraining)"),
+        ("code", GITHUB_FAST_START),
         ("code", """import numpy as np, pandas as pd
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader

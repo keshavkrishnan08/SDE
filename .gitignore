@@ -11,6 +11,13 @@ outputs/results/*.csv
 *.pth
 *.ckpt
 
+# But DO keep the colab_outputs/ folder (trained Notebook 1 artifacts, ~30MB)
+# These let Notebooks 2-5 skip the 4-6hr VAE training step.
+!colab_outputs/**/*.pt
+!colab_outputs/**/*.npy
+!colab_outputs/**/*.csv
+!colab_outputs/**/*.parquet
+
 # Python
 __pycache__/
 *.pyc

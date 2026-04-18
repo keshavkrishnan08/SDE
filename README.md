@@ -32,6 +32,8 @@ See [`notebooks/README.md`](notebooks/README.md) for detailed execution instruct
 
 Total runtime: ~12-20 hours of compute, split across 5 sessions. Fits within Kaggle's free 30-hour weekly quota.
 
+> **Fast-start:** Notebook 1 outputs (trained VAE + extracted latents + splits, ~30 MB) are committed to this repo under [`colab_outputs/`](colab_outputs/). Notebooks 2-5 automatically pull them at startup, so you can **skip Notebook 1 entirely** and jump straight into SDE / Score / Baselines / Ablations / Figures. Total remaining compute drops to ~8-15 hours.
+
 ---
 
 ## Local development
