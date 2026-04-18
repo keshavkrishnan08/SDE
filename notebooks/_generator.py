@@ -2091,6 +2091,115 @@ pivot_std = agg_df.pivot(index="horizon_min", columns="metric", values="std").ro
 print("Means:"); print(pivot.to_string())
 print("\\nStds:"); print(pivot_std.to_string())
 """),
+        ("markdown", """## 1b. Post-hoc conformal calibration
+
+The raw Neural SDE forecasts are sharp but under-dispersed (PICP ~0.5 instead of 0.9)
+— a known pathology of SDE Matching on near-continuous latent dynamics. We fix this
+with split-conformal prediction: widen the interval half-width by the validation-set
+residual quantile so that test coverage matches the nominal 90%.
+"""),
+        ("code", """# ==== Post-hoc conformal calibration ====
+# For each horizon, compute calibrated intervals using validation set residuals.
+# Procedure:
+#   1. Run forecasts on validation set
+#   2. Compute absolute residuals r = |y - median(samples)|
+#   3. Take q_alpha = (1-alpha)-th quantile of r  (for 90% coverage, alpha=0.1)
+#   4. Define test intervals as [median - q_alpha, median + q_alpha]
+# This gives guaranteed 90% marginal coverage on test under exchangeability.
+# We also report calibration-adjusted CRPS by blending samples toward the median
+# with a scale factor derived from the same calibration set.
+
+sde.eval(); score.eval()
+va = data["val"]
+N_VAL_CAL = min(500, len(va["Z"]) - max(HORIZONS) - 1)
+
+def gen_forecasts(data_split, n_eval, sde_m, score_m):
+    res = {}
+    for h in HORIZONS:
+        yt, ys, rm = [], [], []
+        for i in range(0, n_eval, 32):
+            idx = list(range(i, min(i + 32, n_eval)))
+            z0  = torch.from_numpy(data_split["Z"][idx]).float().to(DEVICE)
+            c   = torch.from_numpy(data_split["cov"][idx]).float().to(DEVICE)
+            cti = torch.from_numpy(data_split["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+            with torch.no_grad():
+                endp = solve_sde_horizons(sde_m, z0, [h], c, cti, N=N_SAMPLES)[h]
+                B, N, d = endp.shape
+                g = score_m.sample(endp.view(B*N, d),
+                                   cti.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
+                                   c.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
+                                   n=1).squeeze(-1).view(B, N).cpu().numpy()
+            for k, ii in enumerate(idx):
+                j = ii + h
+                if j < len(data_split["ghi"]):
+                    yt.append(data_split["ghi"][j]); ys.append(g[k]); rm.append(data_split["ramp"][j])
+        res[h] = {"yt": np.array(yt), "ys": np.array(ys), "ramp": np.array(rm)}
+    return res
+
+print("Generating validation-set forecasts for calibration ...")
+val_forecasts = gen_forecasts(va, N_VAL_CAL, sde, score)
+
+# Compute calibration half-widths per horizon
+ALPHA = 0.10  # 90% intervals
+conformal_q = {}
+for h in HORIZONS:
+    f = val_forecasts[h]
+    med = np.median(f["ys"], axis=1)
+    r = np.abs(f["yt"] - med)
+    # Split-conformal quantile with finite-sample correction
+    n = len(r)
+    k = int(np.ceil((n + 1) * (1 - ALPHA)))
+    q = np.sort(r)[min(k - 1, n - 1)] if n > 0 else 0.0
+    conformal_q[h] = float(q)
+    print(f"  h={HORIZON_MIN[h]} min: conformal q_{int((1-ALPHA)*100)}% = {q:.2f} W/m²")
+
+# Apply to test forecasts (seed 42 already generated in Notebook 2, regenerate fresh here)
+print("\\nGenerating test-set forecasts + applying calibration ...")
+test_forecasts = gen_forecasts(data["test"], N_EVAL, sde, score)
+
+calibrated_results = []
+for h in HORIZONS:
+    f = test_forecasts[h]
+    yt, ys = f["yt"], f["ys"]
+    med = np.median(ys, axis=1)
+    # Raw metrics
+    raw_m = all_metrics(yt, ys, is_ramp=f["ramp"])
+    # Calibrated intervals
+    q = conformal_q[h]
+    lo = med - q; hi = med + q
+    cal_picp = float(((yt >= lo) & (yt <= hi)).mean())
+    y_range = yt.max() - yt.min()
+    cal_pinaw = float((hi - lo).mean() / max(y_range, 1e-9))
+    # CRPS with variance inflation: rescale samples around median so their std
+    # matches the calibrated half-width.
+    raw_sd = ys.std(axis=1)
+    target_sd = q / 1.645   # half-width at 90% for a Gaussian
+    scale = np.where(raw_sd > 1e-3, target_sd[None].T / raw_sd[:, None], 1.0)  # (N,1)
+    ys_cal = med[:, None] + (ys - med[:, None]) * scale
+    cal_crps = float(crps_empirical(yt, ys_cal).mean())
+    calibrated_results.append({
+        "horizon_min": HORIZON_MIN[h],
+        "raw_crps":   raw_m["crps"],   "cal_crps":   cal_crps,
+        "raw_picp":   raw_m["picp"],   "cal_picp":   cal_picp,
+        "raw_pinaw":  raw_m["pinaw"],  "cal_pinaw":  cal_pinaw,
+        "rmse":       raw_m["rmse"],
+        "mae":        raw_m["mae"],
+        "conformal_q_Wm2": q,
+    })
+
+df_cal = pd.DataFrame(calibrated_results)
+df_cal.to_csv(RESULTS_DIR / "solar_sde_calibrated.csv", index=False)
+print("\\n" + "=" * 80)
+print("CALIBRATION RESULTS (SolarSDE, seed 42)")
+print("=" * 80)
+print(df_cal.to_string(index=False))
+print()
+print(f"After conformal calibration:")
+print(f"  PICP target: {int((1-ALPHA)*100)}%")
+for r in calibrated_results:
+    print(f"    h={r['horizon_min']:>2} min: {r['raw_picp']*100:5.1f}% -> {r['cal_picp']*100:5.1f}%"
+          f"   CRPS {r['raw_crps']:6.2f} -> {r['cal_crps']:6.2f}")
+"""),
         ("markdown", "## 2. Re-generate per-point results for CTI analysis (seed 42)"),
         ("code", """# Load seed 42 models (from Notebook 2 checkpoints)
 sde = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM, drift_h=256, diff_h=64).to(DEVICE)
