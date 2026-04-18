@@ -689,6 +689,16 @@ class LatentNeuralSDE(nn.Module):
 
 SCORE_MODEL = '''\
 # ==== Conditional Score-Matching Irradiance Decoder (CSMID) ====
+#
+# IMPORTANT: GHI is normalized to [-1, 1] internally. Denoising diffusion requires
+# targets with approximately unit variance; reverse sampling from N(0, 1) cannot
+# reach arbitrary target magnitudes. GHI_SCALE normalizes to [0, 1] then centers.
+#
+# Training:  ghi_raw / GHI_SCALE * 2 - 1    in [-1, 1]
+# Sampling:  (x + 1) / 2 * GHI_SCALE        back to W/m^2
+
+GHI_SCALE = 1200.0   # ~max physically-plausible GHI on Earth; all samples fit in [0, 1]
+
 class ScoreRes(nn.Module):
     def __init__(self, d):
         super().__init__()
@@ -719,19 +729,29 @@ class CondScoreDecoder(nn.Module):
         self.register_buffer("alphas_cum", ac)
         self.register_buffer("sac", torch.sqrt(ac))
         self.register_buffer("s1mac", torch.sqrt(1 - ac))
-    def q(self, g0, si, eps):
-        return self.sac[si].unsqueeze(-1) * g0 + self.s1mac[si].unsqueeze(-1) * eps
-    def training_loss(self, g0, z, cti, c):
+
+    @staticmethod
+    def _normalize(g_wm2):
+        return g_wm2 / GHI_SCALE * 2.0 - 1.0        # W/m^2 -> [-1, 1]
+
+    @staticmethod
+    def _denormalize(g_norm):
+        return (g_norm + 1.0) / 2.0 * GHI_SCALE     # [-1, 1] -> W/m^2
+
+    def training_loss(self, g0_wm2, z, cti, c):
+        """g0_wm2 in W/m^2. Internally normalize to [-1, 1] then do DSM."""
+        g0 = self._normalize(g0_wm2)
         B = g0.shape[0]
         si = torch.randint(0, self.steps, (B,), device=g0.device)
         sn = (si.float() / self.steps).unsqueeze(-1)
         eps = torch.randn_like(g0)
-        gs = self.q(g0, si, eps)
-        pred = self.score(gs, sn, z, cti, c)
-        target = -eps / self.s1mac[si].unsqueeze(-1)
-        return {"loss": F.mse_loss(pred, target)}
+        gs = self.sac[si].unsqueeze(-1) * g0 + self.s1mac[si].unsqueeze(-1) * eps
+        pred_noise = self.score(gs, sn, z, cti, c)   # predict noise directly (epsilon-param)
+        return {"loss": F.mse_loss(pred_noise, eps)}
+
     @torch.no_grad()
     def sample(self, z, cti, c, n=1):
+        """Returns GHI samples in W/m^2."""
         B = z.shape[0]
         z_e = z.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
         cti_e = cti.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
@@ -739,14 +759,17 @@ class CondScoreDecoder(nn.Module):
         x = torch.randn(B * n, 1, device=z.device)
         for i in reversed(range(self.steps)):
             sn = torch.full((B * n, 1), i / self.steps, device=z.device)
-            score = self.score(x, sn, z_e, cti_e, c_e)
+            eps_pred = self.score(x, sn, z_e, cti_e, c_e)
             b, a, ac = self.betas[i], self.alphas[i], self.alphas_cum[i]
-            mean = (1 / a.sqrt()) * (x + b * score * (1 - ac).sqrt())
+            # DDPM eps-parameterization reverse step
+            mean = (1 / a.sqrt()) * (x - b / (1 - ac).sqrt() * eps_pred)
             if i > 0:
                 x = mean + b.sqrt() * torch.randn_like(x)
             else:
                 x = mean
-        return x.view(B, n)
+        # x is in normalized space; denormalize back to W/m^2 and clip to physical range
+        g_wm2 = self._denormalize(x).clamp(min=0.0, max=GHI_SCALE)
+        return g_wm2.view(B, n)
 '''
 
 METRICS_CODE = '''\
