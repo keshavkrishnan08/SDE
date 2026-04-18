@@ -793,11 +793,25 @@ def all_metrics(y_true, y_samples, is_ramp=None, alpha=0.9):
 '''
 
 EM_SOLVER = '''\
-# ==== Euler-Maruyama SDE solver ====
+# ==== Euler-Maruyama SDE solver with stability clamping ====
+# The Neural SDE is trained on 1-step dynamics (SDE Matching); without clamping,
+# long-horizon rollouts can drift out of the VAE latent distribution and the drift
+# MLP will extrapolate catastrophically. We clamp per-step drift, diffusion, and
+# the state vector to stay within ~4σ of training latent statistics.
+
+# Compute training-latent stats once at module load.
+_train_Z_np = np.load(LATENT_DIR / "train_latents.npy")
+Z_MEAN = torch.from_numpy(_train_Z_np.mean(0)).float().to(DEVICE)
+Z_STD  = torch.from_numpy(_train_Z_np.std(0)).float().to(DEVICE) + 1e-6
+Z_CLAMP_STDS = 4.0
+MU_CAP = 5.0
+SIGMA_CAP = 2.0
+
 def em_step(drift_fn, diff_fn, z, t, c, cti, dt):
-    mu = drift_fn(z, t, c)
-    sigma = diff_fn(z, cti)
-    return z + mu * dt + sigma * (dt ** 0.5) * torch.randn_like(z)
+    mu = drift_fn(z, t, c).clamp(-MU_CAP, MU_CAP)
+    sigma = diff_fn(z, cti).clamp(0.0, SIGMA_CAP)
+    z_new = z + mu * dt + sigma * (dt ** 0.5) * torch.randn_like(z)
+    return torch.clamp(z_new, Z_MEAN - Z_CLAMP_STDS * Z_STD, Z_MEAN + Z_CLAMP_STDS * Z_STD)
 
 def solve_sde_horizons(sde, z0, horizons, c, cti, N=50, dt=1.0):
     B, d = z0.shape
@@ -1099,14 +1113,16 @@ for h in HORIZONS:
     m = all_metrics(yt, ys, is_ramp=rm)
     m["horizon_min"] = HORIZON_MIN[h]; m["horizon_steps"] = h
     m["n_eval"] = len(yt)
+    m.setdefault("ramp_crps", 0.0)
     results_by_horizon[h] = m
     print(f"  CRPS={m['crps']:.3f}  RMSE={m['rmse']:.2f}  MAE={m['mae']:.2f}  "
-          f"PICP={m['picp']:.3f}  PINAW={m['pinaw']:.3f}  Ramp-CRPS={m.get('ramp_crps', 0):.3f}")
+          f"PICP={m['picp']:.3f}  PINAW={m['pinaw']:.3f}  Ramp-CRPS={m['ramp_crps']:.3f}")
 
 df_res = pd.DataFrame.from_dict(results_by_horizon, orient="index").sort_values("horizon_min")
 df_res.to_csv(RESULTS_DIR / "solar_sde_main_results.csv", index=False)
 print("\\nSolarSDE main results:")
-print(df_res[["horizon_min", "crps", "rmse", "mae", "picp", "pinaw", "ramp_crps"]].to_string())
+cols_show = [c for c in ["horizon_min", "crps", "rmse", "mae", "picp", "pinaw", "ramp_crps"] if c in df_res.columns]
+print(df_res[cols_show].to_string(index=False))
 """),
         ("markdown", "## 9. Zip outputs"),
         ("code", ZIP_AND_DOWNLOAD),
