@@ -203,15 +203,16 @@ for dest, rel in optional_nb2.items():
 if n_missing > 0:
     raise RuntimeError(f"{n_missing} required Notebook 1 files missing — cannot proceed.")
 
-# Notebook 2 artifacts may be in Drive from your recent run, not GitHub.
+# Notebook 2 artifacts may be in Drive from your recent run, GitHub, or absent.
+# If absent, we will train them inline in Stage 0 below.
 SDE_CKPT = CHECKPOINT_DIR / "sde_best.pt"
 SCORE_CKPT = CHECKPOINT_DIR / "score_best.pt"
-assert SDE_CKPT.exists() and SCORE_CKPT.exists(), (
-    "Notebook 2 outputs (sde_best.pt, score_best.pt) not found in persistent storage. "
-    "Please run Notebook 2 first, or ensure /content/drive/MyDrive/solarsde_outputs/checkpoints/ "
-    "contains both files."
-)
-print(f"\\nAll required files present. Ready to run.")
+NEED_NB2_TRAINING = not (SDE_CKPT.exists() and SCORE_CKPT.exists())
+if NEED_NB2_TRAINING:
+    print("\\nSDE + Score checkpoints NOT found — will train them inline in Stage 0.")
+else:
+    print(f"\\nSDE + Score checkpoints present.  Skipping Stage 0.")
+print("Ready to run.")
 '''
 
 SHARED_CODE = '''\
@@ -441,6 +442,135 @@ N_SAMPLES = 50
 N_EVAL = min(1000, len(data["test"]["Z"]) - max(HORIZONS) - 1)
 SEQ_LEN = 30
 print(f"Horizons: {list(HORIZON_MIN.values())} min, MC samples: {N_SAMPLES}, N_EVAL: {N_EVAL}")
+'''
+
+STAGE0_CODE = '''\
+# ==== STAGE 0: Train SDE + Score Decoder if missing (was Notebook 2) ====
+if not NEED_NB2_TRAINING:
+    print("[SKIP] Stage 0 — SDE + Score checkpoints already present.")
+else:
+    print("=" * 70)
+    print("STAGE 0: Training Neural SDE + Score Decoder (inline)")
+    print("=" * 70)
+
+    class LatentSeqDataset(Dataset):
+        def __init__(self, d):
+            self.Z=d["Z"]; self.cti=d["cti"]; self.ghi=d["ghi"]; self.cov=d["cov"]
+        def __len__(self): return max(0, len(self.Z) - 1)
+        def __getitem__(self, i):
+            return {"z_t": torch.from_numpy(self.Z[i]).float(),
+                    "z_next": torch.from_numpy(self.Z[i+1]).float(),
+                    "cti": torch.tensor(float(self.cti[i])),
+                    "ghi": torch.tensor(float(self.ghi[i])),
+                    "cov": torch.from_numpy(self.cov[i]).float() if self.cov.shape[1] > 0 else torch.zeros(C_DIM)}
+
+    tr_ds_s0 = LatentSeqDataset(data["train"])
+    va_ds_s0 = LatentSeqDataset(data["val"])
+
+    # ---- Train SDE ----
+    print("\\n[S0a] Training Neural SDE (150 epochs) ...")
+    torch.manual_seed(42); np.random.seed(42)
+    sde0 = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    opt = torch.optim.Adam(sde0.parameters(), lr=1e-4)
+    dl_tr = DataLoader(tr_ds_s0, batch_size=128, shuffle=True, drop_last=True)
+    dl_va = DataLoader(va_ds_s0, batch_size=128, shuffle=False)
+    EPOCHS_SDE = 150
+    best_val = float("inf"); t0 = time.time(); hist = []
+    for ep in range(1, EPOCHS_SDE + 1):
+        sde0.train(); tl = td = ts = 0; n = 0
+        for b in dl_tr:
+            z = b["z_t"].to(DEVICE); zn = b["z_next"].to(DEVICE)
+            cti = b["cti"].to(DEVICE).unsqueeze(-1); c = b["cov"].to(DEVICE)
+            t = torch.zeros(z.shape[0], 1, device=DEVICE)
+            losses = sde0.sde_matching_loss(z, zn, t, c, cti)
+            opt.zero_grad(); losses["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(sde0.parameters(), 1.0); opt.step()
+            tl += losses["loss"].item(); td += losses["drift"].item(); ts += losses["diffusion"].item(); n += 1
+        tl /= n; td /= n; ts /= n
+        sde0.eval(); vl = vn = 0
+        with torch.no_grad():
+            for b in dl_va:
+                z = b["z_t"].to(DEVICE); zn = b["z_next"].to(DEVICE)
+                cti = b["cti"].to(DEVICE).unsqueeze(-1); c = b["cov"].to(DEVICE)
+                t = torch.zeros(z.shape[0], 1, device=DEVICE)
+                vl += sde0.sde_matching_loss(z, zn, t, c, cti)["loss"].item(); vn += 1
+        vl /= max(vn, 1)
+        hist.append({"epoch": ep, "train_loss": tl, "drift": td, "diffusion": ts, "val_loss": vl})
+        if ep % 15 == 0 or ep == 1:
+            print(f"  SDE ep {ep:3d}/{EPOCHS_SDE} | train={tl:.5f} | val={vl:.5f} | {(time.time()-t0)/60:.1f}min")
+        if vl < best_val:
+            best_val = vl; torch.save(sde0.state_dict(), SDE_CKPT)
+    pd.DataFrame(hist).to_csv(RESULTS_DIR / "sde_training_history.csv", index=False)
+    print(f"  SDE done. Best val: {best_val:.6f}. Time: {(time.time()-t0)/60:.1f} min")
+
+    # ---- Train Score Decoder ----
+    print("\\n[S0b] Training Score Decoder (150 epochs, cosine LR) ...")
+    torch.manual_seed(42)
+    score0 = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    opt_s = torch.optim.Adam(score0.parameters(), lr=2e-4)
+    EPOCHS_SCORE = 150
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s, T_max=EPOCHS_SCORE, eta_min=1e-5)
+    dl_tr_s = DataLoader(tr_ds_s0, batch_size=256, shuffle=True, drop_last=True)
+    dl_va_s = DataLoader(va_ds_s0, batch_size=256, shuffle=False)
+    best_val = float("inf"); t0 = time.time(); hist = []
+    for ep in range(1, EPOCHS_SCORE + 1):
+        score0.train(); tl = 0; n = 0
+        for b in dl_tr_s:
+            z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
+            c = b["cov"].to(DEVICE); g = b["ghi"].to(DEVICE).unsqueeze(-1)
+            l = score0.training_loss(g, z, cti, c)["loss"]
+            opt_s.zero_grad(); l.backward()
+            torch.nn.utils.clip_grad_norm_(score0.parameters(), 1.0)
+            opt_s.step(); tl += l.item(); n += 1
+        tl /= n; sched.step()
+        score0.eval(); vl = vn = 0
+        with torch.no_grad():
+            for b in dl_va_s:
+                z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
+                c = b["cov"].to(DEVICE); g = b["ghi"].to(DEVICE).unsqueeze(-1)
+                vl += score0.training_loss(g, z, cti, c)["loss"].item(); vn += 1
+        vl /= max(vn, 1)
+        hist.append({"epoch": ep, "train_loss": tl, "val_loss": vl, "lr": opt_s.param_groups[0]["lr"]})
+        if ep % 10 == 0 or ep == 1:
+            print(f"  Score ep {ep:3d}/{EPOCHS_SCORE} | train={tl:.4f} | val={vl:.4f} | lr={opt_s.param_groups[0]['lr']:.2e} | {(time.time()-t0)/60:.1f}min")
+        if vl < best_val:
+            best_val = vl; torch.save(score0.state_dict(), SCORE_CKPT)
+    pd.DataFrame(hist).to_csv(RESULTS_DIR / "score_training_history.csv", index=False)
+    print(f"  Score done. Best val: {best_val:.4f}. Time: {(time.time()-t0)/60:.1f} min")
+
+    # ---- Run main evaluation immediately so Stage A has solar_sde_main_results.csv ----
+    print("\\n[S0c] Running main SolarSDE evaluation at all horizons ...")
+    sde0.load_state_dict(torch.load(SDE_CKPT, map_location=DEVICE, weights_only=False)); sde0.eval()
+    score0.load_state_dict(torch.load(SCORE_CKPT, map_location=DEVICE, weights_only=False)); score0.eval()
+    te = data["test"]; res_s = {}
+    for h in HORIZONS:
+        yt, ys, rm = [], [], []
+        for i in tqdm(range(0, N_EVAL, 32), desc=f"  h={HORIZON_MIN[h]}min"):
+            idx = list(range(i, min(i + 32, N_EVAL)))
+            z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
+            c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
+            cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+            with torch.no_grad():
+                endp = solve_sde_horizons(sde0, z0, [h], c, cti, N=N_SAMPLES)[h]
+                B, N, d = endp.shape
+                g = score0.sample(endp.view(B*N, d),
+                                 cti.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
+                                 c.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
+                                 n=1).squeeze(-1).view(B, N).cpu().numpy()
+            for k, ii in enumerate(idx):
+                j = ii + h
+                if j < len(te["ghi"]):
+                    yt.append(te["ghi"][j]); ys.append(g[k]); rm.append(te["ramp"][j])
+        m = all_metrics(np.array(yt), np.array(ys), is_ramp=np.array(rm))
+        m["horizon_min"] = HORIZON_MIN[h]; m["horizon_steps"] = h; m["n_eval"] = len(yt)
+        res_s[h] = m
+        print(f"    CRPS={m['crps']:.2f}  RMSE={m['rmse']:.2f}  PICP={m['picp']:.3f}  PINAW={m['pinaw']:.3f}")
+    pd.DataFrame.from_dict(res_s, orient="index").sort_values("horizon_min").to_csv(
+        RESULTS_DIR / "solar_sde_main_results.csv", index=False)
+    print("\\n[S0] STAGE 0 COMPLETE.")
+    del sde0, score0, tr_ds_s0, va_ds_s0
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 '''
 
 BASELINES_CODE = '''\
@@ -1400,6 +1530,8 @@ def combined_nb():
         ("markdown", "## 1. Shared code (metrics, SDE solver, models)"),
         ("code", SHARED_CODE),
         ("code", LOAD_DATA_CODE),
+        ("markdown", "## STAGE 0 — (auto) Train SDE + Score Decoder if missing"),
+        ("code", STAGE0_CODE),
         ("markdown", "## STAGE A — Baselines (persistence, smart persistence, LSTM, MC-Dropout, CSDI)"),
         ("code", BASELINES_CODE),
         ("markdown", "## STAGE B — Ablations (no-CTI, no-score, no-SDE)"),
