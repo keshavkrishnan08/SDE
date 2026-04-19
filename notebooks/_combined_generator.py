@@ -113,6 +113,25 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 print(f"Persistent storage: {PERSIST_DIR}")
 
+# ==== Clean-start toggle (set True on FIRST Kaggle run or when switching to v2 arch) ====
+# v1 checkpoints are incompatible with v2 architecture; clearing them forces retrain.
+CLEAN_START_V2 = False    # flip to True ONCE if switching from v1 -> v2
+if CLEAN_START_V2:
+    print("CLEAN_START_V2=True: removing old v1 checkpoints + results ...")
+    for f in ["checkpoints/sde_best.pt", "checkpoints/sde_final.pt",
+              "checkpoints/score_best.pt", "checkpoints/score_final.pt",
+              "checkpoints/sde_a2_best.pt", "checkpoints/sde_a5_best.pt",
+              "checkpoints/linear_decoder_a4.pt",
+              "results/solar_sde_main_results.csv",
+              "results/main_results_combined.csv",
+              "results/ablation_results.csv",
+              "results/solar_sde_calibrated.csv"]:
+        p = PERSIST_DIR / f
+        if p.exists():
+            p.unlink()
+            print(f"  removed {p.name}")
+    print("Clean slate ready — Stage 0 will retrain with v2.")
+
 # ==== GPU setup ====
 import torch, torch.nn as nn, torch.nn.functional as F
 import numpy as np, pandas as pd
@@ -1537,8 +1556,21 @@ if IN_COLAB:
     from google.colab import files
     try: files.download(str(zip_path))
     except Exception as e: print(f"Auto-download failed: {e}. File at {zip_path}")
+elif IN_KAGGLE:
+    # Copy the zip + the two headline CSVs to /kaggle/working/ top-level
+    # so they show up prominently in the Output tab of the notebook.
+    top = Path("/kaggle/working")
+    shutil.copy(zip_path, top / zip_path.name)
+    for key_file in ["results/main_results_combined.csv",
+                     "results/ablation_results.csv",
+                     "results/solar_sde_calibrated.csv"]:
+        src = PERSIST_DIR / key_file
+        if src.exists():
+            shutil.copy(src, top / src.name)
+    print(f"Kaggle: zip + key CSVs copied to /kaggle/working/. Use Output tab to download,")
+    print(f"or 'Save Version' to commit them permanently as notebook outputs.")
 else:
-    print(f"On Kaggle: download via Output tab or from {zip_path}")
+    print(f"Local: file at {zip_path}")
 
 print("\\n" + "=" * 70)
 print("ALL STAGES COMPLETE")
