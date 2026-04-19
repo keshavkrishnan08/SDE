@@ -638,7 +638,19 @@ print("Latent extraction complete.")
 '''
 
 SDE_MODEL = '''\
-# ==== Neural SDE model ====
+# ==== Neural SDE model (v2: diffusion floor + regularization) ====
+#
+# Key fixes from v1:
+#  1. Diffusion FLOOR: forces sigma >= SIGMA_FLOOR to prevent SDE collapse on
+#     clear-sky days (where one-step residual is near zero, old SDE learned sigma=0).
+#  2. Log-diffusion loss: matches log(sigma^2) to log(residual) which is better
+#     conditioned than MSE on squared sigma.
+#  3. CTI-modulated floor: even the minimum diffusion scales with CTI so clear-sky
+#     uncertainty stays narrow, cloudy-sky uncertainty grows.
+#  4. Drift target: predict direct z_next (not rate) to avoid tiny-rate collapse.
+
+SIGMA_FLOOR_BASE = 0.01     # per-dim minimum diffusion; covers model noise
+
 class ResBlock(nn.Module):
     def __init__(self, d):
         super().__init__()
@@ -658,14 +670,20 @@ class DriftNet(nn.Module):
         return self.net(torch.cat([z, t, c], dim=-1))
 
 class CTIDiffNet(nn.Module):
-    """CTI-gated diffusion: σ = Softplus(MLP(z) * Softplus(MLP(CTI)))"""
-    def __init__(self, z_dim=64, h=64):
+    """CTI-gated diffusion with floor:
+         sigma = SIGMA_FLOOR_BASE * (1 + 10*CTI) + Softplus(MLP(z) * Softplus(MLP(CTI)))
+    Guarantees sigma >= SIGMA_FLOOR_BASE everywhere, and floor grows with CTI.
+    """
+    def __init__(self, z_dim=64, h=64, sigma_floor=SIGMA_FLOOR_BASE):
         super().__init__()
+        self.sigma_floor = sigma_floor
         self.cti_gate = nn.Sequential(nn.Linear(1, h), nn.Softplus())
         self.state = nn.Sequential(nn.Linear(z_dim, h), nn.SiLU(inplace=True))
         self.out = nn.Sequential(nn.Linear(h, z_dim), nn.Softplus())
     def forward(self, z, cti):
-        return self.out(self.state(z) * self.cti_gate(cti))
+        base_floor = self.sigma_floor * (1.0 + 10.0 * cti)   # CTI-scaled floor
+        learned = self.out(self.state(z) * self.cti_gate(cti))
+        return base_floor + learned
 
 class LatentNeuralSDE(nn.Module):
     def __init__(self, z_dim=64, c_dim=5, drift_h=256, diff_h=64, lambda_sigma=1.0):
@@ -681,23 +699,31 @@ class LatentNeuralSDE(nn.Module):
         sigma = self.diffusion(z, cti)
         dz = (zn - z) / dt
         drift_l = F.mse_loss(mu, dz)
-        resid = (zn - z - mu * dt).pow(2) / dt
-        diff_l = F.mse_loss(sigma.pow(2), resid)
-        return {"loss": drift_l + self.lambda_sigma * diff_l,
-                "drift": drift_l, "diffusion": diff_l}
+        # Log-space diffusion matching: avoids scale issues when residuals are tiny
+        resid = (zn - z - mu * dt).pow(2) / dt + 1e-8
+        log_diff_l = F.mse_loss(torch.log(sigma.pow(2) + 1e-8), torch.log(resid))
+        return {"loss": drift_l + self.lambda_sigma * log_diff_l,
+                "drift": drift_l, "diffusion": log_diff_l}
 '''
 
 SCORE_MODEL = '''\
-# ==== Conditional Score-Matching Irradiance Decoder (CSMID) ====
+# ==== Conditional Score-Matching Irradiance Decoder (CSMID v2) ====
 #
-# IMPORTANT: GHI is normalized to [-1, 1] internally. Denoising diffusion requires
-# targets with approximately unit variance; reverse sampling from N(0, 1) cannot
-# reach arbitrary target magnitudes. GHI_SCALE normalizes to [0, 1] then centers.
+# BIG CHANGE FROM V1: Now predicts CLEAR-SKY INDEX k_t = GHI / GHI_clearsky
+# instead of raw GHI. This:
+#   1. Removes the ~600 W/m² solar-elevation trend that persistence trivially
+#      captures, letting the model focus on the cloud-driven residual.
+#   2. Stabilizes targets: k_t is in [0, 1.5], independent of time of day.
+#   3. At inference, sample k_t then multiply by GHI_clearsky to recover W/m².
 #
-# Training:  ghi_raw / GHI_SCALE * 2 - 1    in [-1, 1]
-# Sampling:  (x + 1) / 2 * GHI_SCALE        back to W/m^2
+# The score decoder now takes covariate-based conditioning and learns a
+# cloud-modulation distribution, which is the physically meaningful quantity.
+#
+# Training:  k_raw in [0, 1.5] -> normalize to [-1, 1] via / KT_SCALE * 2 - 1
+# Sampling:  sampled k_norm -> denormalize -> multiply by GHI_clearsky(t+h)
 
-GHI_SCALE = 1200.0   # ~max physically-plausible GHI on Earth; all samples fit in [0, 1]
+GHI_SCALE = 1200.0   # kept for legacy; only used if predict_kt=False
+KT_SCALE = 1.5       # clear-sky index bound [0, 1.5]
 
 class ScoreRes(nn.Module):
     def __init__(self, d):
@@ -717,9 +743,18 @@ class ScoreNet(nn.Module):
         return self.net(torch.cat([g, s, z, cti, c], dim=-1))
 
 class CondScoreDecoder(nn.Module):
-    def __init__(self, z_dim=64, c_dim=5, h=256, blocks=2, steps=100, b0=1e-4, b1=0.02):
+    """Score decoder that predicts clear-sky index k_t (not raw GHI).
+
+    Pass predict_kt=True (default) to predict k_t; targets should be k_t values.
+    The SolarSDE pipeline constructs k_t = ghi/ghi_clearsky at training time
+    and reconstructs W/m² at sampling time via ghi_clearsky_target * k_t.
+    """
+    def __init__(self, z_dim=64, c_dim=5, h=256, blocks=2, steps=100, b0=1e-4, b1=0.02,
+                 predict_kt=True):
         super().__init__()
         self.steps = steps
+        self.predict_kt = predict_kt
+        self.target_scale = KT_SCALE if predict_kt else GHI_SCALE
         self.score = ScoreNet(z_dim, c_dim, h, blocks)
         betas = torch.linspace(b0, b1, steps)
         alphas = 1 - betas
@@ -730,28 +765,30 @@ class CondScoreDecoder(nn.Module):
         self.register_buffer("sac", torch.sqrt(ac))
         self.register_buffer("s1mac", torch.sqrt(1 - ac))
 
-    @staticmethod
-    def _normalize(g_wm2):
-        return g_wm2 / GHI_SCALE * 2.0 - 1.0        # W/m^2 -> [-1, 1]
+    def _normalize(self, y_raw):
+        # y_raw in [0, scale] -> [-1, 1]
+        return y_raw / self.target_scale * 2.0 - 1.0
 
-    @staticmethod
-    def _denormalize(g_norm):
-        return (g_norm + 1.0) / 2.0 * GHI_SCALE     # [-1, 1] -> W/m^2
+    def _denormalize(self, y_norm):
+        return (y_norm + 1.0) / 2.0 * self.target_scale
 
-    def training_loss(self, g0_wm2, z, cti, c):
-        """g0_wm2 in W/m^2. Internally normalize to [-1, 1] then do DSM."""
-        g0 = self._normalize(g0_wm2)
-        B = g0.shape[0]
-        si = torch.randint(0, self.steps, (B,), device=g0.device)
+    def training_loss(self, target_raw, z, cti, c):
+        """target_raw: k_t values (if predict_kt) or raw GHI (if not)."""
+        t_norm = self._normalize(target_raw)
+        B = t_norm.shape[0]
+        si = torch.randint(0, self.steps, (B,), device=t_norm.device)
         sn = (si.float() / self.steps).unsqueeze(-1)
-        eps = torch.randn_like(g0)
-        gs = self.sac[si].unsqueeze(-1) * g0 + self.s1mac[si].unsqueeze(-1) * eps
-        pred_noise = self.score(gs, sn, z, cti, c)   # predict noise directly (epsilon-param)
+        eps = torch.randn_like(t_norm)
+        ts = self.sac[si].unsqueeze(-1) * t_norm + self.s1mac[si].unsqueeze(-1) * eps
+        pred_noise = self.score(ts, sn, z, cti, c)
         return {"loss": F.mse_loss(pred_noise, eps)}
 
     @torch.no_grad()
     def sample(self, z, cti, c, n=1):
-        """Returns GHI samples in W/m^2."""
+        """Returns samples in the target scale.
+           If predict_kt=True: returns k_t in [0, KT_SCALE], caller multiplies by ghi_clearsky
+           Else: returns GHI in W/m² (legacy mode).
+        """
         B = z.shape[0]
         z_e = z.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
         cti_e = cti.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
@@ -761,15 +798,13 @@ class CondScoreDecoder(nn.Module):
             sn = torch.full((B * n, 1), i / self.steps, device=z.device)
             eps_pred = self.score(x, sn, z_e, cti_e, c_e)
             b, a, ac = self.betas[i], self.alphas[i], self.alphas_cum[i]
-            # DDPM eps-parameterization reverse step
             mean = (1 / a.sqrt()) * (x - b / (1 - ac).sqrt() * eps_pred)
             if i > 0:
                 x = mean + b.sqrt() * torch.randn_like(x)
             else:
                 x = mean
-        # x is in normalized space; denormalize back to W/m^2 and clip to physical range
-        g_wm2 = self._denormalize(x).clamp(min=0.0, max=GHI_SCALE)
-        return g_wm2.view(B, n)
+        y_out = self._denormalize(x).clamp(min=0.0, max=self.target_scale)
+        return y_out.view(B, n)
 '''
 
 METRICS_CODE = '''\
