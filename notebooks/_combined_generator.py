@@ -167,7 +167,7 @@ required = {
     EXTENDED_DIR  / "test.parquet":         "colab_outputs/extended/test.parquet",
 }
 for split in ["train", "val", "test"]:
-    for key in ["latents", "cti", "ghi", "covariates", "is_ramp"]:
+    for key in ["latents", "cti", "ghi", "covariates", "is_ramp", "kt", "ghi_clearsky"]:
         required[LATENT_DIR / f"{split}_{key}.npy"] = f"colab_outputs/latents/{split}_{key}.npy"
 
 # Notebook 2 artifacts (will only exist on GitHub if re-pushed; otherwise must be in Drive)
@@ -253,13 +253,20 @@ class DriftNet(nn.Module):
         )
     def forward(self, z, t, c): return self.net(torch.cat([z, t, c], dim=-1))
 
+SIGMA_FLOOR_BASE = 0.01
+
 class CTIDiffNet(nn.Module):
-    def __init__(self, z_dim=64, h=64):
+    """v2: diffusion floor + CTI scaling. sigma = floor(1+10*cti) + learned_softplus"""
+    def __init__(self, z_dim=64, h=64, sigma_floor=SIGMA_FLOOR_BASE):
         super().__init__()
+        self.sigma_floor = sigma_floor
         self.cti_gate = nn.Sequential(nn.Linear(1, h), nn.Softplus())
         self.state = nn.Sequential(nn.Linear(z_dim, h), nn.SiLU(inplace=True))
         self.out = nn.Sequential(nn.Linear(h, z_dim), nn.Softplus())
-    def forward(self, z, cti): return self.out(self.state(z) * self.cti_gate(cti))
+    def forward(self, z, cti):
+        base_floor = self.sigma_floor * (1.0 + 10.0 * cti)
+        learned = self.out(self.state(z) * self.cti_gate(cti))
+        return base_floor + learned
 
 class LatentNeuralSDE(nn.Module):
     def __init__(self, z_dim=64, c_dim=5, drift_h=256, diff_h=64, lambda_sigma=1.0):
@@ -273,13 +280,16 @@ class LatentNeuralSDE(nn.Module):
         mu = self.drift(z, t, c); sigma = self.diffusion(z, cti)
         dz = (zn - z) / dt
         drift_l = F.mse_loss(mu, dz)
-        resid = (zn - z - mu * dt).pow(2) / dt
-        diff_l = F.mse_loss(sigma.pow(2), resid)
-        return {"loss": drift_l + self.lambda_sigma * diff_l,
-                "drift": drift_l, "diffusion": diff_l}
+        # v2: log-space diffusion matching (well-conditioned, prevents sigma collapse)
+        resid = (zn - z - mu * dt).pow(2) / dt + 1e-8
+        log_diff_l = F.mse_loss(torch.log(sigma.pow(2) + 1e-8), torch.log(resid))
+        return {"loss": drift_l + self.lambda_sigma * log_diff_l,
+                "drift": drift_l, "diffusion": log_diff_l}
 
-# --- Score Decoder (NORMALIZED GHI, eps-parameterization) ---
+# --- Score Decoder v2 (predicts CLEAR-SKY INDEX k_t, not raw GHI) ---
+# Caller multiplies by ghi_clearsky(t+h) to recover W/m² at inference.
 GHI_SCALE = 1200.0
+KT_SCALE = 1.5
 
 class ScoreRes(nn.Module):
     def __init__(self, d):
@@ -299,9 +309,12 @@ class ScoreNet(nn.Module):
         return self.net(torch.cat([g, s, z, cti, c], dim=-1))
 
 class CondScoreDecoder(nn.Module):
-    def __init__(self, z_dim=64, c_dim=5, h=256, blocks=2, steps=100, b0=1e-4, b1=0.02):
+    def __init__(self, z_dim=64, c_dim=5, h=256, blocks=2, steps=100, b0=1e-4, b1=0.02,
+                 predict_kt=True):
         super().__init__()
         self.steps = steps
+        self.predict_kt = predict_kt
+        self.target_scale = KT_SCALE if predict_kt else GHI_SCALE
         self.score = ScoreNet(z_dim, c_dim, h, blocks)
         betas = torch.linspace(b0, b1, steps); alphas = 1 - betas
         ac = torch.cumprod(alphas, dim=0)
@@ -310,21 +323,21 @@ class CondScoreDecoder(nn.Module):
         self.register_buffer("alphas_cum", ac)
         self.register_buffer("sac", torch.sqrt(ac))
         self.register_buffer("s1mac", torch.sqrt(1 - ac))
-    @staticmethod
-    def _normalize(g_wm2): return g_wm2 / GHI_SCALE * 2.0 - 1.0
-    @staticmethod
-    def _denormalize(g_norm): return (g_norm + 1.0) / 2.0 * GHI_SCALE
-    def training_loss(self, g0_wm2, z, cti, c):
-        g0 = self._normalize(g0_wm2)
-        B = g0.shape[0]
-        si = torch.randint(0, self.steps, (B,), device=g0.device)
+    def _normalize(self, y):     return y / self.target_scale * 2.0 - 1.0
+    def _denormalize(self, y):   return (y + 1.0) / 2.0 * self.target_scale
+    def training_loss(self, target_raw, z, cti, c):
+        """target_raw: k_t in [0, KT_SCALE] if predict_kt else GHI in [0, GHI_SCALE]."""
+        t_norm = self._normalize(target_raw)
+        B = t_norm.shape[0]
+        si = torch.randint(0, self.steps, (B,), device=t_norm.device)
         sn = (si.float() / self.steps).unsqueeze(-1)
-        eps = torch.randn_like(g0)
-        gs = self.sac[si].unsqueeze(-1) * g0 + self.s1mac[si].unsqueeze(-1) * eps
-        pred_noise = self.score(gs, sn, z, cti, c)
+        eps = torch.randn_like(t_norm)
+        ts = self.sac[si].unsqueeze(-1) * t_norm + self.s1mac[si].unsqueeze(-1) * eps
+        pred_noise = self.score(ts, sn, z, cti, c)
         return {"loss": F.mse_loss(pred_noise, eps)}
     @torch.no_grad()
     def sample(self, z, cti, c, n=1):
+        """Returns samples in target scale (k_t if predict_kt else GHI)."""
         B = z.shape[0]
         z_e = z.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
         cti_e = cti.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
@@ -337,8 +350,8 @@ class CondScoreDecoder(nn.Module):
             mean = (1 / a.sqrt()) * (x - b / (1 - ac).sqrt() * eps_pred)
             if i > 0: x = mean + b.sqrt() * torch.randn_like(x)
             else:     x = mean
-        g_wm2 = self._denormalize(x).clamp(min=0.0, max=GHI_SCALE)
-        return g_wm2.view(B, n)
+        y_out = self._denormalize(x).clamp(min=0.0, max=self.target_scale)
+        return y_out.view(B, n)
 
 # --- Metrics ---
 def crps_empirical(y_true, y_samples):
@@ -419,6 +432,8 @@ def load_split(s):
         "ghi":  np.load(LATENT_DIR / f"{s}_ghi.npy"),
         "cov":  np.load(LATENT_DIR / f"{s}_covariates.npy"),
         "ramp": np.load(LATENT_DIR / f"{s}_is_ramp.npy"),
+        "kt":   np.load(LATENT_DIR / f"{s}_kt.npy"),
+        "gcs":  np.load(LATENT_DIR / f"{s}_ghi_clearsky.npy"),
     }
 data = {s: load_split(s) for s in ["train", "val", "test"]}
 for s, d in data.items():
@@ -456,12 +471,15 @@ else:
     class LatentSeqDataset(Dataset):
         def __init__(self, d):
             self.Z=d["Z"]; self.cti=d["cti"]; self.ghi=d["ghi"]; self.cov=d["cov"]
+            self.kt=d["kt"]; self.gcs=d["gcs"]
         def __len__(self): return max(0, len(self.Z) - 1)
         def __getitem__(self, i):
             return {"z_t": torch.from_numpy(self.Z[i]).float(),
                     "z_next": torch.from_numpy(self.Z[i+1]).float(),
                     "cti": torch.tensor(float(self.cti[i])),
                     "ghi": torch.tensor(float(self.ghi[i])),
+                    "kt":  torch.tensor(float(self.kt[i])),
+                    "gcs": torch.tensor(float(self.gcs[i])),
                     "cov": torch.from_numpy(self.cov[i]).float() if self.cov.shape[1] > 0 else torch.zeros(C_DIM)}
 
     tr_ds_s0 = LatentSeqDataset(data["train"])
@@ -503,10 +521,10 @@ else:
     pd.DataFrame(hist).to_csv(RESULTS_DIR / "sde_training_history.csv", index=False)
     print(f"  SDE done. Best val: {best_val:.6f}. Time: {(time.time()-t0)/60:.1f} min")
 
-    # ---- Train Score Decoder ----
-    print("\\n[S0b] Training Score Decoder (150 epochs, cosine LR) ...")
+    # ---- Train Score Decoder (v2: predicts k_t = GHI/GHI_clearsky) ----
+    print("\\n[S0b] Training Score Decoder (150 epochs, cosine LR, target=k_t) ...")
     torch.manual_seed(42)
-    score0 = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    score0 = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_kt=True).to(DEVICE)
     opt_s = torch.optim.Adam(score0.parameters(), lr=2e-4)
     EPOCHS_SCORE = 150
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s, T_max=EPOCHS_SCORE, eta_min=1e-5)
@@ -517,8 +535,8 @@ else:
         score0.train(); tl = 0; n = 0
         for b in dl_tr_s:
             z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
-            c = b["cov"].to(DEVICE); g = b["ghi"].to(DEVICE).unsqueeze(-1)
-            l = score0.training_loss(g, z, cti, c)["loss"]
+            c = b["cov"].to(DEVICE); kt = b["kt"].to(DEVICE).unsqueeze(-1)   # <-- k_t target
+            l = score0.training_loss(kt, z, cti, c)["loss"]
             opt_s.zero_grad(); l.backward()
             torch.nn.utils.clip_grad_norm_(score0.parameters(), 1.0)
             opt_s.step(); tl += l.item(); n += 1
@@ -527,8 +545,8 @@ else:
         with torch.no_grad():
             for b in dl_va_s:
                 z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
-                c = b["cov"].to(DEVICE); g = b["ghi"].to(DEVICE).unsqueeze(-1)
-                vl += score0.training_loss(g, z, cti, c)["loss"].item(); vn += 1
+                c = b["cov"].to(DEVICE); kt = b["kt"].to(DEVICE).unsqueeze(-1)
+                vl += score0.training_loss(kt, z, cti, c)["loss"].item(); vn += 1
         vl /= max(vn, 1)
         hist.append({"epoch": ep, "train_loss": tl, "val_loss": vl, "lr": opt_s.param_groups[0]["lr"]})
         if ep % 10 == 0 or ep == 1:
@@ -538,7 +556,7 @@ else:
     pd.DataFrame(hist).to_csv(RESULTS_DIR / "score_training_history.csv", index=False)
     print(f"  Score done. Best val: {best_val:.4f}. Time: {(time.time()-t0)/60:.1f} min")
 
-    # ---- Run main evaluation immediately so Stage A has solar_sde_main_results.csv ----
+    # ---- Run main evaluation (reconstruct GHI = k_t_sampled * ghi_clearsky(t+h)) ----
     print("\\n[S0c] Running main SolarSDE evaluation at all horizons ...")
     sde0.load_state_dict(torch.load(SDE_CKPT, map_location=DEVICE, weights_only=False)); sde0.eval()
     score0.load_state_dict(torch.load(SCORE_CKPT, map_location=DEVICE, weights_only=False)); score0.eval()
@@ -550,17 +568,22 @@ else:
             z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
             c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
             cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+            # Future ghi_clearsky for each sample's target time (t+h)
+            gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
+                                   for ii in idx], dtype=np.float32)
             with torch.no_grad():
                 endp = solve_sde_horizons(sde0, z0, [h], c, cti, N=N_SAMPLES)[h]
                 B, N, d = endp.shape
-                g = score0.sample(endp.view(B*N, d),
+                kt_samples = score0.sample(endp.view(B*N, d),
                                  cti.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                  c.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                  n=1).squeeze(-1).view(B, N).cpu().numpy()
+                # Reconstruct W/m²: GHI = k_t * ghi_clearsky(t+h)
+                ghi_samples = kt_samples * gcs_future[:, None]
             for k, ii in enumerate(idx):
                 j = ii + h
                 if j < len(te["ghi"]):
-                    yt.append(te["ghi"][j]); ys.append(g[k]); rm.append(te["ramp"][j])
+                    yt.append(te["ghi"][j]); ys.append(ghi_samples[k]); rm.append(te["ramp"][j])
         m = all_metrics(np.array(yt), np.array(ys), is_ramp=np.array(rm))
         m["horizon_min"] = HORIZON_MIN[h]; m["horizon_steps"] = h; m["n_eval"] = len(yt)
         res_s[h] = m
@@ -605,13 +628,16 @@ else:
                 z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
                 c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
                 cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+                gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
+                                       for ii in idx], dtype=np.float32)
                 with torch.no_grad():
                     endp = solve_sde_horizons(sde, z0, [h], c, cti, N=N_SAMPLES)[h]
                     B, N, d = endp.shape
-                    g = score.sample(endp.view(B*N, d),
+                    kt_s = score.sample(endp.view(B*N, d),
                                      cti.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                      c.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                      n=1).squeeze(-1).view(B, N).cpu().numpy()
+                    g = kt_s * gcs_future[:, None]   # reconstruct W/m²
                 for k, ii in enumerate(idx):
                     j = ii + h
                     if j < len(te["ghi"]):
@@ -1010,14 +1036,17 @@ else:
             z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
             c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
             cti0 = torch.zeros(len(idx), 1, device=DEVICE)
+            gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
+                                   for ii in idx], dtype=np.float32)
             with torch.no_grad():
                 endp = solve_sde_horizons(sde_a2, z0, [h], c, cti0, N=N_SAMPLES)[h]
                 B, N, d = endp.shape
-                g = score_full.sample(
+                kt_s = score_full.sample(
                     endp.view(B*N, d),
                     cti0.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
                     c.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1), n=1
                 ).squeeze(-1).view(B, N).cpu().numpy()
+                g = kt_s * gcs_future[:, None]
             for k, ii in enumerate(idx):
                 j = ii + h
                 if j < len(te["ghi"]):
@@ -1130,13 +1159,16 @@ else:
             z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
             c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
             cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+            gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
+                                   for ii in idx], dtype=np.float32)
             with torch.no_grad():
                 endp = solve_ode_horizons(sde_a5.drift, z0, [h], c, dt=1.0)[h]
                 B = len(idx)
                 endp_rep = endp.unsqueeze(1).expand(-1, N_SAMPLES, -1).reshape(-1, Z_DIM)
                 cti_rep = cti.unsqueeze(1).expand(-1, N_SAMPLES, -1).reshape(-1, 1)
                 c_rep = c.unsqueeze(1).expand(-1, N_SAMPLES, -1).reshape(-1, C_DIM)
-                g = score_full.sample(endp_rep, cti_rep, c_rep, n=1).squeeze(-1).view(B, N_SAMPLES).cpu().numpy()
+                kt_s = score_full.sample(endp_rep, cti_rep, c_rep, n=1).squeeze(-1).view(B, N_SAMPLES).cpu().numpy()
+                g = kt_s * gcs_future[:, None]
             for k, ii in enumerate(idx):
                 j = ii + h
                 if j < len(te["ghi"]):
@@ -1191,13 +1223,16 @@ else:
                 z0 = torch.from_numpy(split_data["Z"][idx]).float().to(DEVICE)
                 c = torch.from_numpy(split_data["cov"][idx]).float().to(DEVICE)
                 cti = torch.from_numpy(split_data["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+                gcs_future = np.array([split_data["gcs"][ii + h] if (ii + h) < len(split_data["gcs"]) else 0.0
+                                       for ii in idx], dtype=np.float32)
                 with torch.no_grad():
                     endp = solve_sde_horizons(sde, z0, [h], c, cti, N=N_SAMPLES)[h]
                     B, N, d = endp.shape
-                    g = score.sample(endp.view(B*N, d),
+                    kt_s = score.sample(endp.view(B*N, d),
                                      cti.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
                                      c.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
                                      n=1).squeeze(-1).view(B, N).cpu().numpy()
+                    g = kt_s * gcs_future[:, None]
                 for k, ii in enumerate(idx):
                     j = ii + h
                     if j < len(split_data["ghi"]):
