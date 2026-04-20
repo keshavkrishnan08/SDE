@@ -559,6 +559,213 @@ SEQ_LEN = 30
 print(f"Horizons: {list(HORIZON_MIN.values())} min, MC samples: {N_SAMPLES}, N_EVAL: {N_EVAL}")
 '''
 
+STAGE_MINUS2_CODE = '''\
+# ==== STAGE -2 (OPTIONAL): Pretrain VAE on Stanford SKIPP'D ====
+# Stanford SKIPP'D: 497 training days of 64x64 sky images from a Stanford rooftop
+# fisheye camera (vs. our 5 days of Golden CO). Much more cloud diversity.
+# Pretraining the VAE on this richer distribution should give latents that
+# generalize better to cloud transitions — exactly what v4 struggles with.
+#
+# This stage is OPTIONAL (set ENABLE_STANFORD_PRETRAIN below to True to run).
+# Adds ~3-4 hours to the notebook but should substantially improve cloud-regime
+# forecasting.
+
+ENABLE_STANFORD_PRETRAIN = False    # flip to True to run this stage
+
+STANFORD_VAE_CKPT = CHECKPOINT_DIR / "vae_stanford_pretrained.pt"
+STAGE_M2_DONE = (CHECKPOINT_DIR / "vae_best.pt").exists() and \\
+                (CHECKPOINT_DIR / "vae_best.pt").stat().st_size > 1_000_000 and \\
+                STANFORD_VAE_CKPT.exists()
+
+if not ENABLE_STANFORD_PRETRAIN or STAGE_M2_DONE:
+    if ENABLE_STANFORD_PRETRAIN and STAGE_M2_DONE:
+        print("[SKIP] Stage -2: Stanford pretrained VAE already exists.")
+    else:
+        print("[SKIP] Stage -2 disabled (ENABLE_STANFORD_PRETRAIN=False).")
+else:
+    print("=" * 70)
+    print("STAGE -2: Pretraining VAE on Stanford SKIPP'D (cloudy California)")
+    print("=" * 70)
+    pip_install("h5py")
+    import h5py
+
+    SF_DIR = WORK_DIR / "stanford_skippd"
+    SF_DIR.mkdir(parents=True, exist_ok=True)
+    sf_hdf5 = SF_DIR / "2017_2019_images_pv_processed.hdf5"
+    sf_tv_times = SF_DIR / "times_trainval.npy"
+
+    # Download dataset (~3-4 GB)
+    if not sf_hdf5.exists() or sf_hdf5.stat().st_size < 1_000_000_000:
+        print("Downloading Stanford SKIPP'D benchmark (~3-4 GB) ...")
+        import requests
+        url = "https://stacks.stanford.edu/file/dj417rh1007/2017_2019_images_pv_processed.hdf5"
+        r = requests.get(url, stream=True, timeout=3600)
+        total = int(r.headers.get("content-length", 0))
+        with open(sf_hdf5, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc="HDF5") as pb:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk); pb.update(len(chunk))
+        # times_trainval
+        r = requests.get("https://stacks.stanford.edu/file/dj417rh1007/times_trainval.npy", timeout=600)
+        sf_tv_times.write_bytes(r.content)
+
+    # Open HDF5 and pretrain VAE
+    print("\\nLoading Stanford trainval images ...")
+    with h5py.File(sf_hdf5, "r") as f:
+        # Keys: likely 'trainval', 'test' with 'images_log', 'pv_log' sub-arrays
+        if "trainval" in f:
+            grp = f["trainval"]
+            img_key = "images_log" if "images_log" in grp else list(grp.keys())[0]
+            sf_imgs = grp[img_key][:]
+        else:
+            # Fallback: flat structure
+            sf_imgs = f[list(f.keys())[0]][:]
+    print(f"Stanford images: {sf_imgs.shape} dtype={sf_imgs.dtype}")
+
+    class SfDS(Dataset):
+        def __init__(self, imgs, target=128):
+            self.imgs = imgs; self.target = target
+        def __len__(self): return len(self.imgs)
+        def __getitem__(self, i):
+            img = torch.from_numpy(self.imgs[i]).float() / 255.0
+            if img.dim() == 3: img = img.permute(2, 0, 1)    # HWC -> CHW
+            img = img.unsqueeze(0)
+            img = F.interpolate(img, size=self.target, mode="bilinear", align_corners=False)
+            return img.squeeze(0)
+
+    sf_ds = SfDS(sf_imgs)
+    dl = DataLoader(sf_ds, batch_size=64, shuffle=True, num_workers=2,
+                    pin_memory=True, drop_last=True)
+
+    # VAE architecture (matches Notebook 1)
+    class Enc(nn.Module):
+        def __init__(self, latent=64, ch=(32,64,128,256)):
+            super().__init__(); L, ic = [], 3
+            for c in ch:
+                L += [nn.Conv2d(ic, c, 4, 2, 1), nn.GroupNorm(min(32, c), c), nn.SiLU(inplace=True)]
+                ic = c
+            self.conv = nn.Sequential(*L); self.pool = nn.AdaptiveAvgPool2d(1)
+            self.fc_mu = nn.Linear(ch[-1], latent); self.fc_lv = nn.Linear(ch[-1], latent)
+        def forward(self, x):
+            h = self.pool(self.conv(x)).flatten(1); return self.fc_mu(h), self.fc_lv(h)
+    class Dec(nn.Module):
+        def __init__(self, latent=64, ch=(256,128,64,32)):
+            super().__init__(); self.init_ch = ch[0]
+            self.fc = nn.Linear(latent, ch[0]*8*8); L = []
+            for i in range(len(ch)-1):
+                L += [nn.ConvTranspose2d(ch[i], ch[i+1], 4, 2, 1),
+                      nn.GroupNorm(min(32, ch[i+1]), ch[i+1]), nn.SiLU(inplace=True)]
+            L += [nn.ConvTranspose2d(ch[-1], 3, 4, 2, 1), nn.Sigmoid()]
+            self.deconv = nn.Sequential(*L)
+        def forward(self, z): return self.deconv(self.fc(z).view(-1, self.init_ch, 8, 8))
+    class VAE(nn.Module):
+        def __init__(self, latent=64, beta=0.1):
+            super().__init__(); self.beta = beta
+            self.encoder = Enc(latent); self.decoder = Dec(latent)
+        def forward(self, x):
+            mu, lv = self.encoder(x); z = mu + torch.exp(0.5*lv)*torch.randn_like(mu)
+            return self.decoder(z), mu, lv
+        def loss(self, x, rec, mu, lv):
+            r = F.mse_loss(rec, x); k = -0.5*torch.mean(1+lv-mu.pow(2)-lv.exp())
+            return r + self.beta*k
+
+    torch.manual_seed(42)
+    vae = VAE(latent=64, beta=0.1).to(DEVICE)
+    opt = torch.optim.Adam(vae.parameters(), lr=1e-4)
+
+    EPOCHS = 30
+    print(f"Pretraining VAE on Stanford for {EPOCHS} epochs ...")
+    best = float("inf")
+    for ep in range(1, EPOCHS + 1):
+        vae.train(); tl = 0; n = 0
+        for img in dl:
+            img = img.to(DEVICE, non_blocking=True)
+            rec, mu, lv = vae(img)
+            l = vae.loss(img, rec, mu, lv)
+            opt.zero_grad(); l.backward()
+            torch.nn.utils.clip_grad_norm_(vae.parameters(), 1.0); opt.step()
+            tl += l.item(); n += 1
+        tl /= n
+        print(f"  Pretrain ep {ep}/{EPOCHS}: loss={tl:.4f}")
+        if tl < best:
+            best = tl; torch.save(vae.state_dict(), STANFORD_VAE_CKPT)
+
+    print(f"\\nStanford pretraining done. Best loss: {best:.4f}")
+
+    # Fine-tune on Golden CloudCV
+    print("\\nFine-tuning VAE on Golden CloudCV images for 15 epochs ...")
+    # Reuse Stage -1's image download logic or pull existing images from data/
+    # For simplicity here, we reload VAE and fine-tune on the images used by Notebook 1
+    # (those images were downloaded in Stage -1 if that ran, or we skip fine-tuning here)
+
+    # Load the prepared splits + process original images if they exist locally
+    RAW_DIR = WORK_DIR / "cloudcv"
+    if RAW_DIR.exists() and any(RAW_DIR.glob("2019_*/images/*.jpg")):
+        print("Found Golden CloudCV images from Stage -1. Fine-tuning ...")
+        IMG_SIZE = 128
+        def load_img(path, size=IMG_SIZE):
+            from PIL import Image
+            img = Image.open(path).convert("RGB")
+            w, h = img.size; side = min(w, h); l, t = (w-side)//2, (h-side)//2
+            img = img.crop((l, t, l+side, t+side)).resize((size, size), Image.BILINEAR)
+            return np.array(img, dtype=np.float32) / 255.0
+
+        # Build Golden dataset
+        import pandas as pd
+        train_df = pd.read_parquet(SPLITS_DIR / "train.parquet")
+        if "image_exists" in train_df.columns:
+            train_df = train_df[train_df["image_exists"]].reset_index(drop=True)
+
+        def fix_path(p):
+            from pathlib import Path as _P
+            fn = _P(p).name
+            for day in RAW_DIR.iterdir():
+                if day.is_dir():
+                    pp = day / "images" / fn
+                    if pp.exists(): return str(pp)
+            return p
+
+        class GoldenDS(Dataset):
+            def __init__(self, paths):
+                self.paths = [fix_path(p) for p in paths]
+            def __len__(self): return len(self.paths)
+            def __getitem__(self, i):
+                arr = load_img(self.paths[i])
+                return torch.from_numpy(arr).permute(2, 0, 1)
+        gds = GoldenDS(train_df["image_path"].tolist())
+        gdl = DataLoader(gds, batch_size=32, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+
+        # Reload Stanford-pretrained weights into vae
+        vae.load_state_dict(torch.load(STANFORD_VAE_CKPT, map_location=DEVICE, weights_only=False))
+        opt_ft = torch.optim.Adam(vae.parameters(), lr=5e-5)   # lower LR for fine-tuning
+        FT_EP = 15
+        best_ft = float("inf")
+        for ep in range(1, FT_EP + 1):
+            vae.train(); tl = 0; n = 0
+            for img in gdl:
+                img = img.to(DEVICE, non_blocking=True)
+                rec, mu, lv = vae(img); l = vae.loss(img, rec, mu, lv)
+                opt_ft.zero_grad(); l.backward()
+                torch.nn.utils.clip_grad_norm_(vae.parameters(), 1.0); opt_ft.step()
+                tl += l.item(); n += 1
+            tl /= n
+            print(f"  Fine-tune ep {ep}/{FT_EP}: loss={tl:.4f}")
+            if tl < best_ft:
+                best_ft = tl
+                torch.save(vae.state_dict(), CHECKPOINT_DIR / "vae_best.pt")
+
+        print(f"\\nFine-tuned VAE saved to vae_best.pt. Best: {best_ft:.4f}")
+        print("!! IMPORTANT: latents must be re-extracted with the new VAE before Stages 0+ !!")
+        print("   Delete colab_outputs/latents/*.npy (except kt, gcs) to force re-extraction")
+
+    # Clean up Stanford data to save disk
+    import shutil
+    shutil.rmtree(SF_DIR, ignore_errors=True)
+    print("Stanford raw data removed to free disk.")
+    del vae, sf_imgs, sf_ds, dl
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+'''
+
 STAGE_MINUS1_CODE = '''\
 # ==== STAGE -1: Image feature extraction (optical flow + sun-ROI + cloud fraction) ====
 # This is OPTIONAL — if image_features.npy is present, we skip. Otherwise we either:
@@ -2081,6 +2288,8 @@ def combined_nb():
         ("markdown", "## 1. Shared code (metrics, SDE solver, models)"),
         ("code", SHARED_CODE),
         ("code", LOAD_DATA_CODE),
+        ("markdown", "## STAGE -2 — (Optional) Pretrain VAE on Stanford SKIPP'D for cloud diversity"),
+        ("code", STAGE_MINUS2_CODE),
         ("markdown", "## STAGE -1 — Image feature extraction (optical flow, sun-ROI, cloud fraction)"),
         ("code", STAGE_MINUS1_CODE),
         ("markdown", "## STAGE 0 — (auto) Train SDE + Score Decoder if missing"),
