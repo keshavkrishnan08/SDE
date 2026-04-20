@@ -1377,42 +1377,69 @@ else:
     pd.DataFrame.from_dict(res_a2, orient="index").sort_values("horizon_min").to_csv(
         RESULTS_DIR / "ablation_a2_no_cti.csv", index=False)
 
-    # --- A4: linear decoder z->GHI, no score matching ---
-    print("\\n[B-A4] Training linear decoder ...")
+    # --- A4 (FIXED): MLP regressor predicting delta_kt with Gaussian noise ---
+    # Earlier bug: trained to predict GHI(t) from z(t), then asked to predict GHI(t+h)
+    # from z(t+h) at inference — cross-distribution collapse (CRPS 500+).
+    # v4 A4 matches v4 A1's parameterization exactly (delta_kt + kt_current + c),
+    # but replaces the DDPM score-matching decoder with a simple MLP predicting
+    # mean + log-variance of delta_kt. This tests "is the diffusion process needed?"
+    print("\\n[B-A4] Training MLP delta_kt regressor (no score matching) ...")
     A4_LIN = CHECKPOINT_DIR / "linear_decoder_a4.pt"
-    class LinearDecoder(nn.Module):
-        def __init__(self, z_dim, c_dim, h=64):
+    class DeltaKtRegressor(nn.Module):
+        def __init__(self, z_dim, c_dim, h=128):
             super().__init__()
-            self.net = nn.Sequential(nn.Linear(z_dim + 1 + c_dim, h), nn.SiLU(), nn.Linear(h, 1))
-        def forward(self, z, cti, c): return self.net(torch.cat([z, cti, c], dim=-1)).squeeze(-1)
+            d_in = z_dim + 1 + c_dim + 1   # z + cti + c + kt_current
+            self.net = nn.Sequential(
+                nn.Linear(d_in, h), nn.SiLU(inplace=True),
+                nn.Linear(h, h), nn.SiLU(inplace=True),
+                nn.Linear(h, 2),            # mean, log_var of delta_kt
+            )
+        def forward(self, z, cti, c, kt_cur):
+            h = self.net(torch.cat([z, cti, c, kt_cur], dim=-1))
+            return h[..., 0:1], h[..., 1:2]   # mean, log_var
+
     torch.manual_seed(42)
-    lin = LinearDecoder(Z_DIM, C_DIM, 64).to(DEVICE)
+    reg = DeltaKtRegressor(Z_DIM, C_DIM, 128).to(DEVICE)
+
+    # Reuse the same (z_t, kt_current, kt_target) pairs that score decoder trained on
+    class DeltaRegressorDataset(Dataset):
+        def __init__(self, d):
+            self.Z=d["Z"]; self.cti=d["cti"]; self.cov=d["cov"]; self.kt=d["kt"]
+        def __len__(self): return max(0, len(self.Z) - 1)
+        def __getitem__(self, i):
+            return {"z": torch.from_numpy(self.Z[i]).float(),
+                    "cti": torch.tensor(float(self.cti[i])),
+                    "cov": torch.from_numpy(self.cov[i]).float() if self.cov.shape[1] > 0 else torch.zeros(C_DIM),
+                    "kt_cur": torch.tensor(float(self.kt[i])),
+                    "delta_kt": torch.tensor(float(self.kt[i+1] - self.kt[i]))}
+
+    ds_reg = DeltaRegressorDataset(data["train"])
+    dl_reg = DataLoader(ds_reg, batch_size=256, shuffle=True, drop_last=True)
+
     if A4_LIN.exists():
-        print(f"  [skip retrain]"); lin.load_state_dict(torch.load(A4_LIN, map_location=DEVICE, weights_only=False))
+        print(f"  [skip retrain]"); reg.load_state_dict(torch.load(A4_LIN, map_location=DEVICE, weights_only=False))
     else:
-        opt = torch.optim.Adam(lin.parameters(), lr=1e-3); crit = nn.MSELoss()
-        dl = DataLoader(tr_ds, batch_size=256, shuffle=True, drop_last=True)
+        opt = torch.optim.Adam(reg.parameters(), lr=1e-3)
         for ep in range(1, 41):
-            lin.train(); tl = 0; n = 0
-            for b in dl:
-                z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
-                c = b["cov"].to(DEVICE); g = b["ghi"].to(DEVICE)
-                loss = crit(lin(z, cti, c), g)
-                opt.zero_grad(); loss.backward(); opt.step(); tl += loss.item(); n += 1
-            if ep % 10 == 0: print(f"    A4 ep {ep}: tr={tl/n:.3f}")
-        torch.save(lin.state_dict(), A4_LIN)
-    lin.eval()
+            reg.train(); tl = 0; n = 0
+            for b in dl_reg:
+                z = b["z"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
+                c = b["cov"].to(DEVICE); kt_cur = b["kt_cur"].to(DEVICE).unsqueeze(-1)
+                target = b["delta_kt"].to(DEVICE).unsqueeze(-1)
+                mu, log_var = reg(z, cti, c, kt_cur)
+                # Gaussian NLL loss (mean + variance)
+                log_var = log_var.clamp(-10.0, 2.0)
+                nll = 0.5 * (log_var + (target - mu).pow(2) * torch.exp(-log_var))
+                loss = nll.mean()
+                opt.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(reg.parameters(), 1.0)
+                opt.step(); tl += loss.item(); n += 1
+            if ep % 10 == 0: print(f"    A4 ep {ep}: NLL={tl/n:.4f}")
+        torch.save(reg.state_dict(), A4_LIN)
+    reg.eval()
 
-    # Residual std calibrated on VAL (not train) to avoid leakage
-    with torch.no_grad():
-        z_va = torch.from_numpy(data["val"]["Z"]).float().to(DEVICE)
-        cti_va = torch.from_numpy(data["val"]["cti"]).float().unsqueeze(-1).to(DEVICE)
-        c_va = torch.from_numpy(data["val"]["cov"]).float().to(DEVICE)
-        pred_va = lin(z_va, cti_va, c_va).cpu().numpy()
-    a4_std = float(np.std(data["val"]["ghi"] - pred_va))
-    print(f"  A4 val residual std: {a4_std:.2f} W/m²")
-
-    rng = np.random.default_rng(42); res_a4 = {}
+    # Evaluate A4: propagate z through SDE, predict delta_kt from z(t+h), add to kt(t), × gcs
+    res_a4 = {}
     for h in HORIZONS:
         yt, ys, rm = [], [], []
         for i in range(0, N_EVAL, 32):
@@ -1420,14 +1447,22 @@ else:
             z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
             c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
             cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+            kt_cur = torch.from_numpy(te["kt"][idx]).float().unsqueeze(-1).to(DEVICE)
+            gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
+                                   for ii in idx], dtype=np.float32)
             with torch.no_grad():
                 endp = solve_sde_horizons(sde_full, z0, [h], c, cti, N=N_SAMPLES)[h]
                 B, N, d = endp.shape
-                cti_e = cti.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1)
-                c_e = c.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1)
-                pred = lin(endp.view(B * N, d), cti_e, c_e).view(B, N).cpu().numpy()
-                noise = rng.normal(0, a4_std, size=(B, N))
-                g = np.clip(pred + noise, 0, None)
+                # Gaussian mean + log_var per z path; sample once per path
+                z_flat = endp.view(B*N, d)
+                cti_e = cti.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1)
+                c_e = c.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1)
+                kt_e = kt_cur.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1)
+                mu, log_var = reg(z_flat, cti_e, c_e, kt_e)
+                sigma = (0.5 * log_var.clamp(-10, 2)).exp()
+                delta_sample = mu + sigma * torch.randn_like(mu)
+                kt_samples = (kt_e + delta_sample).clamp(0, 1.5).view(B, N).cpu().numpy()
+                g = kt_samples * gcs_future[:, None]
             for k, ii in enumerate(idx):
                 j = ii + h
                 if j < len(te["ghi"]):
@@ -1709,6 +1744,67 @@ else:
     print()
     n_wins = int((df_strat["winner"] == "SolarSDE").sum())
     print(f"SolarSDE wins on {n_wins}/{len(df_strat)} subsets at h=10min.")
+
+    # === Diebold-Mariano significance test ===
+    # Tests whether SolarSDE's per-point CRPS differs significantly from persistence's.
+    # Uses squared CRPS-loss difference series with Newey-West HAC variance estimator
+    # (horizon-1 bandwidth for 1-step-ahead forecast errors).
+    print("\\n--- Diebold-Mariano test (SolarSDE vs Persistence, per-horizon) ---")
+    from scipy import stats as spstats
+
+    # Regenerate forecasts at each horizon for the DM test (needs per-point losses)
+    npz = np.load(RESULTS_DIR / "test_predictions_h10min.npz")
+    yt_10 = npz["y_true"]; ys_10 = npz["y_samples"]
+    # Per-point CRPS for SolarSDE at h=10min
+    crps_solar_10 = crps_empirical(yt_10, ys_10)
+
+    # Per-point CRPS for persistence at the same eval indices
+    rng = np.random.default_rng(42)
+    pers_std_10 = float(np.std(tr_ghi[60:] - tr_ghi[:-60]))
+    n_eval_dm = min(len(yt_10), len(te["ghi"]) - 60)
+    pers_samples_10 = np.zeros((n_eval_dm, ys_10.shape[1]))
+    for i in range(n_eval_dm):
+        pers_samples_10[i] = np.clip(te["ghi"][i] + rng.normal(0, pers_std_10, size=ys_10.shape[1]), 0, None)
+    crps_pers_10 = crps_empirical(yt_10[:n_eval_dm], pers_samples_10)
+
+    # DM loss differential: d_t = L_solar - L_persistence (negative = SolarSDE better)
+    d = crps_solar_10[:n_eval_dm] - crps_pers_10
+    n_d = len(d); d_mean = d.mean()
+
+    # Newey-West HAC variance (bandwidth = horizon-1 = 0 for 1-step test, so just sample var)
+    # Use a small bandwidth (5) to account for autocorrelation from sliding-window eval
+    bw = 5
+    gamma0 = np.var(d)
+    gamma_sum = 0.0
+    for k in range(1, bw + 1):
+        weight = 1.0 - k / (bw + 1)
+        gamma_k = np.mean((d[k:] - d_mean) * (d[:-k] - d_mean))
+        gamma_sum += 2.0 * weight * gamma_k
+    var_d_hac = (gamma0 + gamma_sum) / n_d
+    dm_stat = d_mean / np.sqrt(max(var_d_hac, 1e-12))
+    p_value = 2.0 * (1.0 - spstats.norm.cdf(abs(dm_stat)))
+
+    dm_row = {
+        "horizon_min": 10,
+        "solarsde_mean_crps": float(crps_solar_10[:n_eval_dm].mean()),
+        "persistence_mean_crps": float(crps_pers_10.mean()),
+        "mean_diff_Lsolar_minus_Lpers": float(d_mean),
+        "dm_stat": float(dm_stat),
+        "p_value_two_sided": float(p_value),
+        "significant_at_0.05": bool(p_value < 0.05),
+        "solarsde_better": bool(d_mean < 0),
+    }
+    print(f"\\nDM test @ h=10min:")
+    for k, v in dm_row.items(): print(f"  {k}: {v}")
+
+    pd.DataFrame([dm_row]).to_csv(RESULTS_DIR / "dm_test_results.csv", index=False)
+    print(f"\\nSaved DM test result to {RESULTS_DIR / 'dm_test_results.csv'}")
+    if dm_row["significant_at_0.05"] and dm_row["solarsde_better"]:
+        print("  → SolarSDE significantly beats persistence at p < 0.05 ✓")
+    elif dm_row["significant_at_0.05"]:
+        print("  → Persistence significantly beats SolarSDE at p < 0.05 ✗")
+    else:
+        print(f"  → Difference not significant (p={dm_row['p_value_two_sided']:.3f})")
 '''
 
 ANALYSIS_CODE = '''\
