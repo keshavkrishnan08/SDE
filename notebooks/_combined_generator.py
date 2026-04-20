@@ -305,10 +305,25 @@ class LatentNeuralSDE(nn.Module):
         return {"loss": drift_l + self.lambda_sigma * log_diff_l,
                 "drift": drift_l, "diffusion": log_diff_l}
 
-# --- Score Decoder v2 (predicts CLEAR-SKY INDEX k_t, not raw GHI) ---
-# Caller multiplies by ghi_clearsky(t+h) to recover W/m² at inference.
+# --- Score Decoder v3 (RESIDUAL prediction: delta_kt = kt(t+h) - kt(t)) ---
+#
+# v2 predicted absolute kt(t+h). For stable conditions where kt(t+h) ≈ kt(t),
+# the model had to learn a near-identity mapping — neural nets are bad at this.
+#
+# v3 predicts delta_kt = kt(t+h) - kt(t). Targets are concentrated near 0
+# (most timesteps have small change). At sampling time, we add the sampled
+# delta to the current kt to get the prediction:
+#
+#   kt(t+h)_predicted = kt(t)_observed + delta_kt_sampled
+#   GHI(t+h) = kt(t+h)_predicted * ghi_clearsky(t+h)
+#
+# This is the persistence-anchored parameterization. Default behavior is
+# "no change" (delta=0 = persistence). Model learns to deviate from
+# persistence only when context says so.
+
 GHI_SCALE = 1200.0
 KT_SCALE = 1.5
+DELTA_KT_SCALE = 1.0    # delta_kt typically in [-1.0, 1.0], rarely outside
 
 class ScoreRes(nn.Module):
     def __init__(self, d):
@@ -319,21 +334,36 @@ class ScoreRes(nn.Module):
 class ScoreNet(nn.Module):
     def __init__(self, z_dim=64, c_dim=5, h=256, blocks=2):
         super().__init__()
-        d_in = 1 + 1 + z_dim + 1 + c_dim
+        # Inputs: (noisy_target, s, z, cti, c, kt_current)
+        d_in = 1 + 1 + z_dim + 1 + c_dim + 1
         layers = [nn.Linear(d_in, h), nn.SiLU(inplace=True)]
         for _ in range(blocks): layers.append(ScoreRes(h))
         layers.append(nn.Linear(h, 1))
         self.net = nn.Sequential(*layers)
-    def forward(self, g, s, z, cti, c):
-        return self.net(torch.cat([g, s, z, cti, c], dim=-1))
+    def forward(self, g, s, z, cti, c, kt_cur):
+        return self.net(torch.cat([g, s, z, cti, c, kt_cur], dim=-1))
 
 class CondScoreDecoder(nn.Module):
+    """v3: predicts delta_kt with persistence anchoring.
+
+    Default mode (predict_mode='delta'):
+      target = kt(t+h) - kt(t)
+      sample: kt(t+h) = kt(t) + delta_sampled
+    Other modes (legacy):
+      'kt'  : predicts kt(t+h) directly (v2)
+      'ghi' : predicts GHI(t+h) directly (v1)
+    """
     def __init__(self, z_dim=64, c_dim=5, h=256, blocks=2, steps=100, b0=1e-4, b1=0.02,
-                 predict_kt=True):
+                 predict_mode='delta'):
         super().__init__()
         self.steps = steps
-        self.predict_kt = predict_kt
-        self.target_scale = KT_SCALE if predict_kt else GHI_SCALE
+        self.predict_mode = predict_mode
+        if predict_mode == 'delta':
+            self.target_scale = DELTA_KT_SCALE
+        elif predict_mode == 'kt':
+            self.target_scale = KT_SCALE
+        else:
+            self.target_scale = GHI_SCALE
         self.score = ScoreNet(z_dim, c_dim, h, blocks)
         betas = torch.linspace(b0, b1, steps); alphas = 1 - betas
         ac = torch.cumprod(alphas, dim=0)
@@ -342,35 +372,66 @@ class CondScoreDecoder(nn.Module):
         self.register_buffer("alphas_cum", ac)
         self.register_buffer("sac", torch.sqrt(ac))
         self.register_buffer("s1mac", torch.sqrt(1 - ac))
-    def _normalize(self, y):     return y / self.target_scale * 2.0 - 1.0
-    def _denormalize(self, y):   return (y + 1.0) / 2.0 * self.target_scale
-    def training_loss(self, target_raw, z, cti, c):
-        """target_raw: k_t in [0, KT_SCALE] if predict_kt else GHI in [0, GHI_SCALE]."""
+
+    def _normalize(self, y):
+        # For delta, scale [-DELTA_KT_SCALE, DELTA_KT_SCALE] -> [-1, 1]
+        if self.predict_mode == 'delta':
+            return y.clamp(-self.target_scale, self.target_scale) / self.target_scale
+        else:
+            return y / self.target_scale * 2.0 - 1.0
+    def _denormalize(self, y):
+        if self.predict_mode == 'delta':
+            return y * self.target_scale
+        else:
+            return (y + 1.0) / 2.0 * self.target_scale
+
+    def training_loss(self, kt_target, kt_current, z, cti, c):
+        """Train on residual (or absolute, depending on mode)."""
+        if self.predict_mode == 'delta':
+            target_raw = kt_target - kt_current
+        elif self.predict_mode == 'kt':
+            target_raw = kt_target
+        else:
+            target_raw = kt_target  # caller passes ghi values in this mode
         t_norm = self._normalize(target_raw)
         B = t_norm.shape[0]
         si = torch.randint(0, self.steps, (B,), device=t_norm.device)
         sn = (si.float() / self.steps).unsqueeze(-1)
         eps = torch.randn_like(t_norm)
         ts = self.sac[si].unsqueeze(-1) * t_norm + self.s1mac[si].unsqueeze(-1) * eps
-        pred_noise = self.score(ts, sn, z, cti, c)
+        kt_cur_in = kt_current.unsqueeze(-1) if kt_current.dim() == 1 else kt_current
+        pred_noise = self.score(ts, sn, z, cti, c, kt_cur_in)
         return {"loss": F.mse_loss(pred_noise, eps)}
+
     @torch.no_grad()
-    def sample(self, z, cti, c, n=1):
-        """Returns samples in target scale (k_t if predict_kt else GHI)."""
+    def sample(self, z, cti, c, kt_current, n=1):
+        """Returns samples in kt-space.
+           predict_mode='delta': returns kt(t+h) = kt_current + delta_sampled (clamped to [0, KT_SCALE])
+           predict_mode='kt'   : returns kt(t+h) directly
+           predict_mode='ghi'  : returns GHI(t+h) directly (caller doesn't multiply by gcs)
+        """
         B = z.shape[0]
         z_e = z.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
         cti_e = cti.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
         c_e = c.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
+        kt_cur_in = kt_current.unsqueeze(-1) if kt_current.dim() == 1 else kt_current
+        kt_cur_e = kt_cur_in.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
         x = torch.randn(B * n, 1, device=z.device)
         for i in reversed(range(self.steps)):
             sn = torch.full((B * n, 1), i / self.steps, device=z.device)
-            eps_pred = self.score(x, sn, z_e, cti_e, c_e)
+            eps_pred = self.score(x, sn, z_e, cti_e, c_e, kt_cur_e)
             b, a, ac = self.betas[i], self.alphas[i], self.alphas_cum[i]
             mean = (1 / a.sqrt()) * (x - b / (1 - ac).sqrt() * eps_pred)
             if i > 0: x = mean + b.sqrt() * torch.randn_like(x)
             else:     x = mean
-        y_out = self._denormalize(x).clamp(min=0.0, max=self.target_scale)
-        return y_out.view(B, n)
+        y_unscaled = self._denormalize(x)   # in target space (delta_kt or kt or ghi)
+        if self.predict_mode == 'delta':
+            kt_out = (kt_cur_e + y_unscaled).clamp(0.0, KT_SCALE)
+        elif self.predict_mode == 'kt':
+            kt_out = y_unscaled.clamp(0.0, KT_SCALE)
+        else:
+            kt_out = y_unscaled.clamp(0.0, GHI_SCALE)
+        return kt_out.view(B, n)
 
 # --- Metrics ---
 def crps_empirical(y_true, y_samples):
@@ -541,21 +602,40 @@ else:
     print(f"  SDE done. Best val: {best_val:.6f}. Time: {(time.time()-t0)/60:.1f} min")
 
     # ---- Train Score Decoder (v2: predicts k_t = GHI/GHI_clearsky) ----
-    print("\\n[S0b] Training Score Decoder (150 epochs, cosine LR, target=k_t) ...")
+    print("\\n[S0b] Training Score Decoder v3 (150 ep, cosine LR, target=delta_kt) ...")
+    print("  v3 predicts kt(t+h) - kt(t) [persistence-anchored residual].")
+    print("  Default behavior: 'no change' (delta=0 = persistence baseline).")
+    print("  Model only has to learn cloud-driven deviations.")
     torch.manual_seed(42)
-    score0 = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_kt=True).to(DEVICE)
+    score0 = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
     opt_s = torch.optim.Adam(score0.parameters(), lr=2e-4)
     EPOCHS_SCORE = 150
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s, T_max=EPOCHS_SCORE, eta_min=1e-5)
-    dl_tr_s = DataLoader(tr_ds_s0, batch_size=256, shuffle=True, drop_last=True)
-    dl_va_s = DataLoader(va_ds_s0, batch_size=256, shuffle=False)
+    # Build training pairs: (z_t, cti_t, cov_t, kt_t) -> kt_{t+1}
+    # Use sequence pairs so kt_target is the NEXT timestep's kt (1-step training).
+    # Multi-step generalization comes from the SDE rolling forward at inference.
+    class TrainPairsDataset(Dataset):
+        def __init__(self, d):
+            self.Z=d["Z"]; self.cti=d["cti"]; self.cov=d["cov"]; self.kt=d["kt"]
+        def __len__(self): return max(0, len(self.Z) - 1)
+        def __getitem__(self, i):
+            return {"z_t": torch.from_numpy(self.Z[i]).float(),
+                    "cti": torch.tensor(float(self.cti[i])),
+                    "cov": torch.from_numpy(self.cov[i]).float() if self.cov.shape[1] > 0 else torch.zeros(C_DIM),
+                    "kt_current": torch.tensor(float(self.kt[i])),
+                    "kt_target":  torch.tensor(float(self.kt[i+1]))}
+    tp_tr = TrainPairsDataset(data["train"]); tp_va = TrainPairsDataset(data["val"])
+    dl_tr_s = DataLoader(tp_tr, batch_size=256, shuffle=True, drop_last=True)
+    dl_va_s = DataLoader(tp_va, batch_size=256, shuffle=False)
     best_val = float("inf"); t0 = time.time(); hist = []
     for ep in range(1, EPOCHS_SCORE + 1):
         score0.train(); tl = 0; n = 0
         for b in dl_tr_s:
             z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
-            c = b["cov"].to(DEVICE); kt = b["kt"].to(DEVICE).unsqueeze(-1)   # <-- k_t target
-            l = score0.training_loss(kt, z, cti, c)["loss"]
+            c = b["cov"].to(DEVICE)
+            kt_tgt = b["kt_target"].to(DEVICE).unsqueeze(-1)
+            kt_cur = b["kt_current"].to(DEVICE).unsqueeze(-1)
+            l = score0.training_loss(kt_tgt, kt_cur, z, cti, c)["loss"]
             opt_s.zero_grad(); l.backward()
             torch.nn.utils.clip_grad_norm_(score0.parameters(), 1.0)
             opt_s.step(); tl += l.item(); n += 1
@@ -564,8 +644,10 @@ else:
         with torch.no_grad():
             for b in dl_va_s:
                 z = b["z_t"].to(DEVICE); cti = b["cti"].to(DEVICE).unsqueeze(-1)
-                c = b["cov"].to(DEVICE); kt = b["kt"].to(DEVICE).unsqueeze(-1)
-                vl += score0.training_loss(kt, z, cti, c)["loss"].item(); vn += 1
+                c = b["cov"].to(DEVICE)
+                kt_tgt = b["kt_target"].to(DEVICE).unsqueeze(-1)
+                kt_cur = b["kt_current"].to(DEVICE).unsqueeze(-1)
+                vl += score0.training_loss(kt_tgt, kt_cur, z, cti, c)["loss"].item(); vn += 1
         vl /= max(vn, 1)
         hist.append({"epoch": ep, "train_loss": tl, "val_loss": vl, "lr": opt_s.param_groups[0]["lr"]})
         if ep % 10 == 0 or ep == 1:
@@ -587,7 +669,7 @@ else:
             z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
             c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
             cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
-            # Future ghi_clearsky for each sample's target time (t+h)
+            kt_cur = torch.from_numpy(te["kt"][idx]).float().unsqueeze(-1).to(DEVICE)
             gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
                                    for ii in idx], dtype=np.float32)
             with torch.no_grad():
@@ -596,8 +678,8 @@ else:
                 kt_samples = score0.sample(endp.view(B*N, d),
                                  cti.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                  c.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
+                                 kt_cur.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                  n=1).squeeze(-1).view(B, N).cpu().numpy()
-                # Reconstruct W/m²: GHI = k_t * ghi_clearsky(t+h)
                 ghi_samples = kt_samples * gcs_future[:, None]
             for k, ii in enumerate(idx):
                 j = ii + h
@@ -647,6 +729,7 @@ else:
                 z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
                 c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
                 cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+                kt_cur = torch.from_numpy(te["kt"][idx]).float().unsqueeze(-1).to(DEVICE)
                 gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
                                        for ii in idx], dtype=np.float32)
                 with torch.no_grad():
@@ -655,8 +738,9 @@ else:
                     kt_s = score.sample(endp.view(B*N, d),
                                      cti.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                      c.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
+                                     kt_cur.unsqueeze(1).expand(B,N,-1).reshape(B*N,-1),
                                      n=1).squeeze(-1).view(B, N).cpu().numpy()
-                    g = kt_s * gcs_future[:, None]   # reconstruct W/m²
+                    g = kt_s * gcs_future[:, None]
                 for k, ii in enumerate(idx):
                     j = ii + h
                     if j < len(te["ghi"]):
@@ -1055,6 +1139,7 @@ else:
             z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
             c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
             cti0 = torch.zeros(len(idx), 1, device=DEVICE)
+            kt_cur = torch.from_numpy(te["kt"][idx]).float().unsqueeze(-1).to(DEVICE)
             gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
                                    for ii in idx], dtype=np.float32)
             with torch.no_grad():
@@ -1063,7 +1148,8 @@ else:
                 kt_s = score_full.sample(
                     endp.view(B*N, d),
                     cti0.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
-                    c.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1), n=1
+                    c.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
+                    kt_cur.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1), n=1
                 ).squeeze(-1).view(B, N).cpu().numpy()
                 g = kt_s * gcs_future[:, None]
             for k, ii in enumerate(idx):
@@ -1178,6 +1264,7 @@ else:
             z0 = torch.from_numpy(te["Z"][idx]).float().to(DEVICE)
             c = torch.from_numpy(te["cov"][idx]).float().to(DEVICE)
             cti = torch.from_numpy(te["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+            kt_cur = torch.from_numpy(te["kt"][idx]).float().unsqueeze(-1).to(DEVICE)
             gcs_future = np.array([te["gcs"][ii + h] if (ii + h) < len(te["gcs"]) else 0.0
                                    for ii in idx], dtype=np.float32)
             with torch.no_grad():
@@ -1186,7 +1273,8 @@ else:
                 endp_rep = endp.unsqueeze(1).expand(-1, N_SAMPLES, -1).reshape(-1, Z_DIM)
                 cti_rep = cti.unsqueeze(1).expand(-1, N_SAMPLES, -1).reshape(-1, 1)
                 c_rep = c.unsqueeze(1).expand(-1, N_SAMPLES, -1).reshape(-1, C_DIM)
-                kt_s = score_full.sample(endp_rep, cti_rep, c_rep, n=1).squeeze(-1).view(B, N_SAMPLES).cpu().numpy()
+                kt_cur_rep = kt_cur.unsqueeze(1).expand(-1, N_SAMPLES, -1).reshape(-1, 1)
+                kt_s = score_full.sample(endp_rep, cti_rep, c_rep, kt_cur_rep, n=1).squeeze(-1).view(B, N_SAMPLES).cpu().numpy()
                 g = kt_s * gcs_future[:, None]
             for k, ii in enumerate(idx):
                 j = ii + h
@@ -1242,6 +1330,7 @@ else:
                 z0 = torch.from_numpy(split_data["Z"][idx]).float().to(DEVICE)
                 c = torch.from_numpy(split_data["cov"][idx]).float().to(DEVICE)
                 cti = torch.from_numpy(split_data["cti"][idx]).float().unsqueeze(-1).to(DEVICE)
+                kt_cur = torch.from_numpy(split_data["kt"][idx]).float().unsqueeze(-1).to(DEVICE)
                 gcs_future = np.array([split_data["gcs"][ii + h] if (ii + h) < len(split_data["gcs"]) else 0.0
                                        for ii in idx], dtype=np.float32)
                 with torch.no_grad():
@@ -1250,6 +1339,7 @@ else:
                     kt_s = score.sample(endp.view(B*N, d),
                                      cti.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
                                      c.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
+                                     kt_cur.unsqueeze(1).expand(B, N, -1).reshape(B*N, -1),
                                      n=1).squeeze(-1).view(B, N).cpu().numpy()
                     g = kt_s * gcs_future[:, None]
                 for k, ii in enumerate(idx):
@@ -1321,6 +1411,90 @@ else:
 
     del sde, score; gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
+'''
+
+STRATIFIED_CODE = '''\
+# ==== STAGE C2: Stratified evaluation by CTI / weather regime ====
+# Tests where SolarSDE wins (or loses) on subsets of test data:
+#   - by CTI quartile (low/mid/high turbulence)
+#   - on ramp events specifically
+#   - by clear-sky-index regime (clear vs cloudy)
+STAGE_C2_OUT = RESULTS_DIR / "stratified_results.csv"
+if STAGE_C2_OUT.exists():
+    print(f"[SKIP] Stage C2 already done: {STAGE_C2_OUT}")
+else:
+    print("=" * 70)
+    print("STAGE C2: Stratified evaluation (where does SolarSDE actually win?)")
+    print("=" * 70)
+
+    # Use the per-point predictions saved in Stage C
+    npz = np.load(RESULTS_DIR / "test_predictions_h10min.npz")
+    yt, ys, is_ramp = npz["y_true"], npz["y_samples"], npz["is_ramp"]
+    crps_per = crps_empirical(yt, ys)
+
+    # Persistence baseline at h=10min for the same eval indices
+    te = data["test"]
+    rng = np.random.default_rng(42)
+    h_steps = 60   # 10 min
+    tr_ghi = data["train"]["ghi"]
+    pers_std = float(np.std(tr_ghi[h_steps:] - tr_ghi[:-h_steps]))
+    n_eval = min(len(yt), len(te["ghi"]) - h_steps)
+
+    pers_samples = np.zeros((n_eval, ys.shape[1]))
+    for i in range(n_eval):
+        pers_samples[i] = np.clip(te["ghi"][i] + rng.normal(0, pers_std, size=ys.shape[1]), 0, None)
+    pers_crps_per = crps_empirical(yt[:n_eval], pers_samples)
+
+    # CTI for each eval index
+    cti_eval = te["cti"][:n_eval]
+    kt_eval  = te["kt"][:n_eval]
+
+    rows = []
+    def stratified_row(name, mask):
+        if mask.sum() < 5:
+            return
+        rows.append({
+            "subset": name,
+            "n_samples": int(mask.sum()),
+            "solarsde_crps": float(crps_per[:n_eval][mask].mean()),
+            "persistence_crps": float(pers_crps_per[mask].mean()),
+            "delta": float(pers_crps_per[mask].mean() - crps_per[:n_eval][mask].mean()),
+            "winner": "SolarSDE" if crps_per[:n_eval][mask].mean() < pers_crps_per[mask].mean() else "Persistence",
+        })
+
+    # All test points
+    stratified_row("All test points", np.ones(n_eval, dtype=bool))
+
+    # By CTI quartile (only over CTI > 0)
+    cti_pos = cti_eval > 0
+    if cti_pos.sum() > 4:
+        qs = np.quantile(cti_eval[cti_pos], [0.25, 0.5, 0.75])
+        for i, name in enumerate(["CTI Q1 (clearest)", "CTI Q2", "CTI Q3", "CTI Q4 (most turbulent)"]):
+            if i == 0:   m = (cti_eval > 0) & (cti_eval <= qs[0])
+            elif i == 3: m = cti_eval >  qs[2]
+            else:        m = (cti_eval > qs[i-1]) & (cti_eval <= qs[i])
+            stratified_row(name, m)
+        # Top decile of CTI specifically
+        q90 = np.quantile(cti_eval[cti_pos], 0.9)
+        stratified_row("CTI top 10% (most turbulent)", cti_eval > q90)
+
+    # By kt regime (clear vs cloudy via kt threshold)
+    stratified_row("Clear (kt > 0.85)", kt_eval > 0.85)
+    stratified_row("Partial cloud (0.5 < kt <= 0.85)", (kt_eval > 0.5) & (kt_eval <= 0.85))
+    stratified_row("Cloudy (kt <= 0.5)",  kt_eval <= 0.5)
+
+    # Ramp events
+    stratified_row("Ramp events only", is_ramp[:n_eval].astype(bool))
+    stratified_row("Non-ramp events", (~is_ramp[:n_eval].astype(bool)))
+
+    df_strat = pd.DataFrame(rows)
+    df_strat.to_csv(STAGE_C2_OUT, index=False)
+
+    print("\\nStratified analysis at h=10min:")
+    print(df_strat.to_string(index=False))
+    print()
+    n_wins = int((df_strat["winner"] == "SolarSDE").sum())
+    print(f"SolarSDE wins on {n_wins}/{len(df_strat)} subsets at h=10min.")
 '''
 
 ANALYSIS_CODE = '''\
@@ -1605,6 +1779,8 @@ def combined_nb():
         ("code", ABLATIONS_CODE),
         ("markdown", "## STAGE C — Conformal Calibration"),
         ("code", CALIBRATION_CODE),
+        ("markdown", "## STAGE C2 — Stratified evaluation (where does SolarSDE win?)"),
+        ("code", STRATIFIED_CODE),
         ("markdown", "## STAGE D — CTI Analysis + Economic Value + Figures"),
         ("code", ANALYSIS_CODE),
         ("markdown", "## Final: zip & download"),
