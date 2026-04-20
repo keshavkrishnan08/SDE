@@ -186,7 +186,8 @@ required = {
     EXTENDED_DIR  / "test.parquet":         "colab_outputs/extended/test.parquet",
 }
 for split in ["train", "val", "test"]:
-    for key in ["latents", "cti", "ghi", "covariates", "is_ramp", "kt", "ghi_clearsky"]:
+    for key in ["latents", "cti", "ghi", "covariates", "is_ramp", "kt", "ghi_clearsky",
+                "physics_features"]:
         required[LATENT_DIR / f"{split}_{key}.npy"] = f"colab_outputs/latents/{split}_{key}.npy"
 
 # Notebook 2 artifacts (will only exist on GitHub if re-pushed; otherwise must be in Drive)
@@ -488,15 +489,21 @@ def em_step(drift_fn, diff_fn, z, t, c, cti, dt):
     return torch.clamp(z_new, Z_MEAN - Z_CLAMP_STDS * Z_STD, Z_MEAN + Z_CLAMP_STDS * Z_STD)
 
 def solve_sde_horizons(sde, z0, horizons, c, cti, N=50, dt=1.0):
+    """v4: with mixed-horizon training, the drift takes (z, normalized_horizon, c).
+    At inference, we pass normalized_horizon = current_step / MAX_HORIZON as time input.
+    This matches how the SDE was trained (drift(z, k/180, c) -> dz/k).
+    The EM step uses physical dt=1.0; drift output is already in per-step units.
+    """
     B, d = z0.shape
     mx = max(horizons); hset = set(horizons)
+    MAX_HORIZON = 180.0
     z = z0.unsqueeze(1).expand(B, N, d).reshape(B * N, d)
     c_e = c.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1)
     cti_e = cti.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1)
     out = {}
     for step in range(mx):
-        t = torch.full((B * N, 1), float(step), device=z0.device)
-        z = em_step(sde.drift, sde.diffusion, z, t, c_e, cti_e, dt)
+        t_norm = torch.full((B * N, 1), (step + 1) / MAX_HORIZON, device=z0.device)
+        z = em_step(sde.drift, sde.diffusion, z, t_norm, c_e, cti_e, dt)
         if (step + 1) in hset: out[step + 1] = z.view(B, N, d).clone()
     return out
 
@@ -506,16 +513,29 @@ print("Shared code loaded.")
 LOAD_DATA_CODE = '''\
 # ==== Load all data tensors ====
 def load_split(s):
+    # v4: concatenate 5 original covariates + 15 physics features + (optional) 10 image features
+    orig_cov = np.load(LATENT_DIR / f"{s}_covariates.npy")
+    phys = np.load(LATENT_DIR / f"{s}_physics_features.npy")
+    # Image features are optional (extracted in-notebook if images are available).
+    img_feat_path = LATENT_DIR / f"{s}_image_features.npy"
+    if img_feat_path.exists():
+        img_feats = np.load(img_feat_path)
+        cov = np.concatenate([orig_cov, phys, img_feats], axis=1).astype(np.float32)
+    else:
+        cov = np.concatenate([orig_cov, phys], axis=1).astype(np.float32)
     return {
         "Z":    np.load(LATENT_DIR / f"{s}_latents.npy"),
         "cti":  np.load(LATENT_DIR / f"{s}_cti.npy"),
         "ghi":  np.load(LATENT_DIR / f"{s}_ghi.npy"),
-        "cov":  np.load(LATENT_DIR / f"{s}_covariates.npy"),
+        "cov":  cov,
         "ramp": np.load(LATENT_DIR / f"{s}_is_ramp.npy"),
         "kt":   np.load(LATENT_DIR / f"{s}_kt.npy"),
         "gcs":  np.load(LATENT_DIR / f"{s}_ghi_clearsky.npy"),
     }
 data = {s: load_split(s) for s in ["train", "val", "test"]}
+print(f"\\n  Covariate dim (v4): {data['train']['cov'].shape[1]}  "
+      f"(5 original + 15 physics + "
+      f"{data['train']['cov'].shape[1] - 20} image features)")
 for s, d in data.items():
     print(f"  {s}: Z={d['Z'].shape}, GHI=[{d['ghi'].min():.0f},{d['ghi'].max():.0f}], ramps={int(d['ramp'].sum())}")
 
@@ -537,6 +557,150 @@ N_SAMPLES = 50
 N_EVAL = min(1000, len(data["test"]["Z"]) - max(HORIZONS) - 1)
 SEQ_LEN = 30
 print(f"Horizons: {list(HORIZON_MIN.values())} min, MC samples: {N_SAMPLES}, N_EVAL: {N_EVAL}")
+'''
+
+STAGE_MINUS1_CODE = '''\
+# ==== STAGE -1: Image feature extraction (optical flow + sun-ROI + cloud fraction) ====
+# This is OPTIONAL — if image_features.npy is present, we skip. Otherwise we either:
+#   a) Download the 8 days of CloudCV images from NREL (2.6 GB) + extract features
+#   b) Skip gracefully if download fails (features default to zero)
+#
+# On Kaggle/Colab this adds ~30-45 min to the run but gives large expected
+# improvement on ramp events and during cloud transitions.
+
+STAGE_M1_OUT = LATENT_DIR / "test_image_features.npy"
+if STAGE_M1_OUT.exists():
+    print(f"[SKIP] Stage -1 done (image features exist).")
+else:
+    print("=" * 70)
+    print("STAGE -1: Extracting image features (optical flow + sun-ROI + cloud fraction)")
+    print("=" * 70)
+    pip_install("opencv-python-headless")
+    import cv2
+    from PIL import Image
+    import tarfile
+
+    RAW_DIR = WORK_DIR / "cloudcv"
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    CLOUDCV_FILES = {
+        "2019_09_07.tar.gz": "https://data.nlr.gov/system/files/248/1727737056-2019_09_07.tar.gz",
+        "2019_09_08.tar.gz": "https://data.nlr.gov/system/files/248/1727737056-2019_09_08.tar.gz",
+        "2019_09_14.tar.gz": "https://data.nlr.gov/system/files/248/1727737056-2019_09_14.tar.gz",
+        "2019_09_15.tar.gz": "https://data.nlr.gov/system/files/248/1727737056-2019_09_15.tar.gz",
+        "2019_09_21.tar.gz": "https://data.nlr.gov/system/files/248/1727737586-2019_09_21.tar.gz",
+        "2019_09_22.tar.gz": "https://data.nlr.gov/system/files/248/1727737586-2019_09_22.tar.gz",
+        "2019_09_28.tar.gz": "https://data.nlr.gov/system/files/248/1727737586-2019_09_28.tar.gz",
+        "2019_09_29.tar.gz": "https://data.nlr.gov/system/files/248/1727737586-2019_09_29.tar.gz",
+    }
+
+    # Download + extract
+    all_days_present = all((RAW_DIR / fn.replace(".tar.gz", "") / "pyranometer.csv").exists()
+                           for fn in CLOUDCV_FILES)
+    if not all_days_present:
+        print("Downloading CloudCV archives ...")
+        for name, url in CLOUDCV_FILES.items():
+            tgz = RAW_DIR / name
+            day_dir = RAW_DIR / name.replace(".tar.gz", "")
+            if (day_dir / "pyranometer.csv").exists():
+                continue
+            if not tgz.exists():
+                r = requests.get(url, stream=True, timeout=600)
+                with open(tgz, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536): f.write(chunk)
+                print(f"  downloaded {name}  ({tgz.stat().st_size/1e6:.0f} MB)")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(tgz, "r:gz") as tf: tf.extractall(day_dir)
+            tgz.unlink()   # free disk
+            print(f"  extracted {day_dir.name}")
+
+    IMG_SIZE = 128
+    def load_img_small(path):
+        img = Image.open(path).convert("RGB")
+        w, h = img.size; side = min(w, h)
+        l, t = (w-side)//2, (h-side)//2
+        img = img.crop((l, t, l+side, t+side)).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
+        return np.array(img, dtype=np.uint8)
+
+    def sun_px(zen, az, size=IMG_SIZE):
+        r_frac = np.clip(zen / 90.0, 0, 1)
+        rp = r_frac * (size / 2 - 5)
+        a = np.deg2rad(az)
+        dx = rp * np.sin(a); dy = -rp * np.cos(a)
+        return int(size // 2 + dx), int(size // 2 + dy)
+
+    def sun_roi(gray, sx, sy, r=12):
+        H, W = gray.shape
+        x0,x1 = max(0,sx-r), min(W,sx+r); y0,y1 = max(0,sy-r), min(H,sy+r)
+        if x1<=x0 or y1<=y0: return 0.0, 0.0, 0.0
+        roi = gray[y0:y1, x0:x1].astype(np.float32)
+        b = roi.mean()/255.0; v = roi.var()/(255.0**2)
+        gx = cv2.Sobel(roi, cv2.CV_32F, 1, 0); gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1)
+        e = np.sqrt(gx**2 + gy**2).mean()/255.0
+        return float(b), float(v), float(e)
+
+    # Helper: fix image_path to point to downloaded location
+    def fix_path(orig_path):
+        fn = Path(orig_path).name
+        for day in RAW_DIR.iterdir():
+            if day.is_dir():
+                p = day / "images" / fn
+                if p.exists(): return str(p)
+        return orig_path
+
+    for split in ["train", "val", "test"]:
+        df = pd.read_parquet(SPLITS_DIR / f"{split}.parquet")
+        if "image_exists" in df.columns:
+            df = df[df["image_exists"]].reset_index(drop=True)
+        n = len(df)
+        feats = np.zeros((n, 10), dtype=np.float32)
+        prev_gray = None
+        print(f"Processing {split} ({n} rows) ...")
+        for i in tqdm(range(n), desc=f"  {split}"):
+            row = df.iloc[i]
+            img_path = fix_path(row["image_path"])
+            if not Path(img_path).exists():
+                prev_gray = None; continue
+            try:
+                img = load_img_small(img_path)
+                gray = np.mean(img, axis=2).astype(np.uint8)
+            except Exception:
+                prev_gray = None; continue
+            # Optical flow
+            if prev_gray is not None:
+                try:
+                    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
+                                                       0.5, 3, 15, 3, 5, 1.2, 0)
+                    fx = flow[..., 0].mean(); fy = flow[..., 1].mean()
+                    mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+                    fmag = mag.mean(); fvar = mag.var()
+                    fdir = np.arctan2(fy, fx)
+                    feats[i, 0] = fx / 10.0; feats[i, 1] = fy / 10.0
+                    feats[i, 2] = fmag / 10.0
+                    feats[i, 3] = np.sin(fdir); feats[i, 4] = np.cos(fdir)
+                    feats[i, 5] = np.tanh(fvar / 100.0)
+                except Exception: pass
+            # Sun ROI
+            sx, sy = sun_px(float(row["solar_zenith"]), float(row.get("solar_azimuth", 0.0)))
+            b, v, e = sun_roi(gray, sx, sy, r=12)
+            feats[i, 6] = b; feats[i, 7] = v; feats[i, 8] = e
+            # Cloud fraction
+            feats[i, 9] = float((img.mean(axis=2) / 255.0 > 0.75).mean())
+            prev_gray = gray
+
+        np.save(LATENT_DIR / f"{split}_image_features.npy", feats)
+        print(f"  saved {split}_image_features.npy  shape={feats.shape}  "
+              f"mean={feats.mean():.3f}  std={feats.std():.3f}")
+
+    # Clean up raw images to save disk
+    import shutil
+    shutil.rmtree(RAW_DIR, ignore_errors=True)
+    print("Image features extracted. Raw images removed to free disk.")
+    print("NOTE: re-load `data` below to pick up new image features in covariates.")
+
+    # Reload data with image features included
+    data = {s: load_split(s) for s in ["train", "val", "test"]}
+    C_DIM = max(1, data["train"]["cov"].shape[1])
+    print(f"C_DIM updated to {C_DIM} (with image features)")
 '''
 
 STAGE0_CODE = '''\
@@ -565,13 +729,44 @@ else:
     tr_ds_s0 = LatentSeqDataset(data["train"])
     va_ds_s0 = LatentSeqDataset(data["val"])
 
-    # ---- Train SDE ----
-    print("\\n[S0a] Training Neural SDE (150 epochs) ...")
+    # ---- Train SDE with MIXED-HORIZON training + ramp oversampling (v4) ----
+    print("\\n[S0a] Training Neural SDE v4 (mixed-horizon, ramp-oversampled) ...")
     torch.manual_seed(42); np.random.seed(42)
     sde0 = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
     opt = torch.optim.Adam(sde0.parameters(), lr=1e-4)
-    dl_tr = DataLoader(tr_ds_s0, batch_size=128, shuffle=True, drop_last=True)
-    dl_va = DataLoader(va_ds_s0, batch_size=128, shuffle=False)
+
+    class MixedHorizonDataset(Dataset):
+        def __init__(self, d, horizon_choices=(1,5,10,30,60,90,120,180), seed=42):
+            self.Z=d["Z"]; self.cti=d["cti"]; self.cov=d["cov"]; self.ramp=d["ramp"]
+            self.hs=horizon_choices; self.max_h=max(horizon_choices)
+            self.rng=np.random.default_rng(seed)
+        def __len__(self): return max(0, len(self.Z) - self.max_h)
+        def __getitem__(self, i):
+            k = int(self.rng.choice(self.hs))
+            return {"z_t": torch.from_numpy(self.Z[i]).float(),
+                    "z_next": torch.from_numpy(self.Z[i+k]).float(),
+                    "cti": torch.tensor(float(self.cti[i])),
+                    "cov": torch.from_numpy(self.cov[i]).float(),
+                    "k":   torch.tensor(float(k))}
+
+    mh_tr = MixedHorizonDataset(data["train"])
+    mh_va = MixedHorizonDataset(data["val"])
+
+    # Ramp oversampling (5x weight on rows containing a ramp within max horizon)
+    ramp_window = np.zeros(len(mh_tr), dtype=np.float32)
+    tr_ramp = data["train"]["ramp"]
+    for i in range(len(mh_tr)):
+        end = min(i + mh_tr.max_h, len(tr_ramp))
+        ramp_window[i] = 1.0 if tr_ramp[i:end].any() else 0.0
+    weights = np.where(ramp_window > 0, 5.0, 1.0).astype(np.float32)
+    from torch.utils.data import WeightedRandomSampler
+    sampler = WeightedRandomSampler(weights=weights.tolist(),
+                                    num_samples=len(mh_tr), replacement=True)
+    dl_tr = DataLoader(mh_tr, batch_size=128, sampler=sampler, drop_last=True, num_workers=0)
+    dl_va = DataLoader(mh_va, batch_size=128, shuffle=False, num_workers=0)
+    print(f"  MixedHorizonDataset: {len(mh_tr)} rows, ramp-in-window fraction = "
+          f"{ramp_window.mean()*100:.1f}% (weighted 5x)")
+
     EPOCHS_SDE = 150
     best_val = float("inf"); t0 = time.time(); hist = []
     for ep in range(1, EPOCHS_SDE + 1):
@@ -579,19 +774,32 @@ else:
         for b in dl_tr:
             z = b["z_t"].to(DEVICE); zn = b["z_next"].to(DEVICE)
             cti = b["cti"].to(DEVICE).unsqueeze(-1); c = b["cov"].to(DEVICE)
-            t = torch.zeros(z.shape[0], 1, device=DEVICE)
-            losses = sde0.sde_matching_loss(z, zn, t, c, cti)
-            opt.zero_grad(); losses["loss"].backward()
+            # Normalized horizon as time input
+            t = (b["k"].float().unsqueeze(-1) / 180.0).to(DEVICE)
+            dt_k = b["k"].float().unsqueeze(-1).to(DEVICE)
+            mu = sde0.drift(z, t, c); sigma = sde0.diffusion(z, cti)
+            dz_per_k = (zn - z) / dt_k
+            drift_l = F.mse_loss(mu, dz_per_k)
+            resid = (zn - z - mu * dt_k).pow(2) / dt_k + 1e-8
+            log_diff_l = F.mse_loss(torch.log(sigma.pow(2) + 1e-8), torch.log(resid))
+            loss = drift_l + sde0.lambda_sigma * log_diff_l
+            opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(sde0.parameters(), 1.0); opt.step()
-            tl += losses["loss"].item(); td += losses["drift"].item(); ts += losses["diffusion"].item(); n += 1
+            tl += loss.item(); td += drift_l.item(); ts += log_diff_l.item(); n += 1
         tl /= n; td /= n; ts /= n
         sde0.eval(); vl = vn = 0
         with torch.no_grad():
             for b in dl_va:
                 z = b["z_t"].to(DEVICE); zn = b["z_next"].to(DEVICE)
                 cti = b["cti"].to(DEVICE).unsqueeze(-1); c = b["cov"].to(DEVICE)
-                t = torch.zeros(z.shape[0], 1, device=DEVICE)
-                vl += sde0.sde_matching_loss(z, zn, t, c, cti)["loss"].item(); vn += 1
+                t = (b["k"].float().unsqueeze(-1) / 180.0).to(DEVICE)
+                dt_k = b["k"].float().unsqueeze(-1).to(DEVICE)
+                mu = sde0.drift(z, t, c); sigma = sde0.diffusion(z, cti)
+                dz_per_k = (zn - z) / dt_k
+                drift_l = F.mse_loss(mu, dz_per_k)
+                resid = (zn - z - mu * dt_k).pow(2) / dt_k + 1e-8
+                log_diff_l = F.mse_loss(torch.log(sigma.pow(2) + 1e-8), torch.log(resid))
+                vl += (drift_l + sde0.lambda_sigma * log_diff_l).item(); vn += 1
         vl /= max(vn, 1)
         hist.append({"epoch": ep, "train_loss": tl, "drift": td, "diffusion": ts, "val_loss": vl})
         if ep % 15 == 0 or ep == 1:
@@ -611,12 +819,10 @@ else:
     opt_s = torch.optim.Adam(score0.parameters(), lr=2e-4)
     EPOCHS_SCORE = 150
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s, T_max=EPOCHS_SCORE, eta_min=1e-5)
-    # Build training pairs: (z_t, cti_t, cov_t, kt_t) -> kt_{t+1}
-    # Use sequence pairs so kt_target is the NEXT timestep's kt (1-step training).
-    # Multi-step generalization comes from the SDE rolling forward at inference.
+    # Training pairs + ramp oversampling for score decoder
     class TrainPairsDataset(Dataset):
         def __init__(self, d):
-            self.Z=d["Z"]; self.cti=d["cti"]; self.cov=d["cov"]; self.kt=d["kt"]
+            self.Z=d["Z"]; self.cti=d["cti"]; self.cov=d["cov"]; self.kt=d["kt"]; self.ramp=d["ramp"]
         def __len__(self): return max(0, len(self.Z) - 1)
         def __getitem__(self, i):
             return {"z_t": torch.from_numpy(self.Z[i]).float(),
@@ -625,8 +831,16 @@ else:
                     "kt_current": torch.tensor(float(self.kt[i])),
                     "kt_target":  torch.tensor(float(self.kt[i+1]))}
     tp_tr = TrainPairsDataset(data["train"]); tp_va = TrainPairsDataset(data["val"])
-    dl_tr_s = DataLoader(tp_tr, batch_size=256, shuffle=True, drop_last=True)
+
+    # Ramp oversampling (weight ramp rows 5x)
+    tr_ramp_arr = data["train"]["ramp"][:len(tp_tr)]
+    weights_s = np.where(tr_ramp_arr, 5.0, 1.0).astype(np.float32)
+    sampler_s = WeightedRandomSampler(weights=weights_s.tolist(),
+                                      num_samples=len(tp_tr), replacement=True)
+    dl_tr_s = DataLoader(tp_tr, batch_size=256, sampler=sampler_s, drop_last=True)
     dl_va_s = DataLoader(tp_va, batch_size=256, shuffle=False)
+    print(f"  Score decoder training: ramp rows weighted 5x "
+          f"({tr_ramp_arr.sum()} ramp / {len(tp_tr)} total)")
     best_val = float("inf"); t0 = time.time(); hist = []
     for ep in range(1, EPOCHS_SCORE + 1):
         score0.train(); tl = 0; n = 0
@@ -1771,6 +1985,8 @@ def combined_nb():
         ("markdown", "## 1. Shared code (metrics, SDE solver, models)"),
         ("code", SHARED_CODE),
         ("code", LOAD_DATA_CODE),
+        ("markdown", "## STAGE -1 — Image feature extraction (optical flow, sun-ROI, cloud fraction)"),
+        ("code", STAGE_MINUS1_CODE),
         ("markdown", "## STAGE 0 — (auto) Train SDE + Score Decoder if missing"),
         ("code", STAGE0_CODE),
         ("markdown", "## STAGE A — Baselines (persistence, smart persistence, LSTM, MC-Dropout, CSDI)"),
