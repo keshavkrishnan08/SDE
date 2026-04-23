@@ -2096,94 +2096,254 @@ for f in ["table1_main_crps.tex", "table2_ablations.tex", "table3_computational.
 # Notebook assembly
 # ================================================================
 
-def final_nb():
-    cells = [
-        ("markdown", HEADER_FINAL_MD),
-        ("markdown", "## 0. Setup"),
-        ("code", SETUP_CODE),
-        ("code", FAST_START_SOFT_CODE),
+# ================================================================
+# Split into three ≤12-hour notebooks so a full run fits inside
+# Kaggle's 12-hour session limit.
+#
+#   07a_foundations  (~9-11h)  Retrain Golden from raw + Stanford SKIPP'D pipeline
+#   07b_training     (~7-10h)  Golden image features + SolarSDE training + multi-seed
+#   07c_evaluation   (~9-12h)  All baselines + ablations + stats + figures + tables
+#
+# Each notebook checkpoints to the same PERSIST_DIR, so running them in order
+# is equivalent to running the monolithic 07 notebook. The soft fast-start
+# pulls any cached artifacts from GitHub; whatever's missing, the current
+# notebook produces.
+#
+# Kaggle workflow:
+#   1. Run 07a. Save output. Attach output dataset to 07b.
+#   2. Run 07b. Save output. Attach both 07a+07b outputs to 07c.
+#   3. Run 07c. Download final zip.
+# ================================================================
 
-        ("markdown", "## 1. Shared model definitions"),
-        ("code", SHARED_CODE),
+# Shared prefix present in every notebook: Setup + fast-start + shared model defs
+_COMMON_PREFIX = [
+    ("markdown", "## 0. Setup"),
+    ("code", SETUP_CODE),
+    ("code", FAST_START_SOFT_CODE),
+    ("markdown", "## 1. Shared model definitions"),
+    ("code", SHARED_CODE),
+]
 
-        ("markdown", "## RETRAIN — Golden CO from raw data (skipped if all artifacts already present)"),
-        ("code", GOLDEN_RETRAIN_GUARD_CODE),
-        # VAE class definitions ALWAYS run so latent extraction / param counting work
-        # even when training is skipped:
-        ("code", "LATENT_DIM = 64\nIMG_SIZE = 128\n" + VAE_MODEL),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not all((DATA_DIR / 'cloudcv' / f).exists() "
-                       "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (DATA_DIR / 'bms' / 'bms_srrl_2019.csv').exists()",
-                       BMS_DOWNLOAD)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (SPLITS_DIR / 'train.parquet').exists()",
-                       PREPROCESS_CODE)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN", IMAGE_DATASET)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (CHECKPOINT_DIR / 'vae_best.pt').exists()",
-                       VAE_TRAIN)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (LATENT_DIR / 'test_latents.npy').exists()",
-                       LATENT_EXTRACT)),
-        ("code", GOLDEN_KT_PHYS_CODE),
-        ("code", GOLDEN_EXTENDED_CODE),
+# Retrain block (used in Part 1 only; Parts 2 and 3 expect artifacts to exist)
+_RETRAIN_BLOCK = [
+    ("markdown", "## RETRAIN — Golden CO from raw data (skipped if all artifacts already present)"),
+    ("code", GOLDEN_RETRAIN_GUARD_CODE),
+    ("code", "LATENT_DIM = 64\nIMG_SIZE = 128\n" + VAE_MODEL),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN and not all((DATA_DIR / 'cloudcv' / f).exists() "
+                   "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD)),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT)),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (DATA_DIR / 'bms' / 'bms_srrl_2019.csv').exists()",
+                   BMS_DOWNLOAD)),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (SPLITS_DIR / 'train.parquet').exists()",
+                   PREPROCESS_CODE)),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN", IMAGE_DATASET)),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (CHECKPOINT_DIR / 'vae_best.pt').exists()",
+                   VAE_TRAIN)),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (LATENT_DIR / 'test_latents.npy').exists()",
+                   LATENT_EXTRACT)),
+    ("code", GOLDEN_KT_PHYS_CODE),
+    ("code", GOLDEN_EXTENDED_CODE),
+]
 
-        ("markdown", "## 2. Load data tensors (tolerant: warns if extended splits missing)"),
-        ("code", LOAD_DATA_TOLERANT_CODE),
+# Helpful check for parts 2 and 3: fail fast if part 1 wasn't run
+_REQUIRE_FOUNDATIONS_CODE = '''\
+# ==== Check that Part 1 (Foundations) artifacts are available ====
+_missing = []
+for p in [CHECKPOINT_DIR / "vae_best.pt",
+          LATENT_DIR / "test_latents.npy",
+          LATENT_DIR / "test_kt.npy",
+          LATENT_DIR / "test_physics_features.npy",
+          SPLITS_DIR / "test.parquet"]:
+    if not p.exists():
+        _missing.append(str(p))
+if _missing:
+    msg = ("This notebook expects Part 1 (07a_foundations) to have been run first.\\n"
+           "Missing artifacts:\\n  " + "\\n  ".join(_missing) +
+           "\\n\\nOn Kaggle: go to Add Data, attach the output dataset from your 07a run.\\n"
+           "Locally: re-run 07a_foundations.ipynb first.")
+    raise RuntimeError(msg)
+print("Part 1 artifacts found — ready to proceed.")
+'''
 
-        ("markdown", "## STAGE A — Stanford SKIPP'D as full second site"),
-        ("code", STANFORD_FULL_PIPELINE_CODE),
+_REQUIRE_TRAINING_CODE = '''\
+# ==== Check that Parts 1+2 (Foundations + Training) artifacts are available ====
+_missing = []
+for p in [CHECKPOINT_DIR / "sde_best.pt",
+          CHECKPOINT_DIR / "score_best.pt",
+          RESULTS_DIR / "solar_sde_main_results.csv"]:
+    if not p.exists():
+        _missing.append(str(p))
+if _missing:
+    msg = ("This notebook expects Parts 1+2 (07a, 07b) to have been run first.\\n"
+           "Missing artifacts:\\n  " + "\\n  ".join(_missing) +
+           "\\n\\nAttach the 07b output dataset on Kaggle, or re-run 07b_training.ipynb.")
+    raise RuntimeError(msg)
+print("Part 1+2 artifacts found — ready to proceed.")
+'''
 
-        ("markdown", "## STAGE B — Image features (Golden, optical flow + sun-ROI + cloud)"),
-        ("code", STAGE_MINUS1_CODE),
 
-        ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume if checkpoints exist)"),
-        ("code", STAGE0_CODE),
-        ("markdown", "## STAGE C2 — Multi-seed runs (seeds 123, 456) for variance estimation"),
-        ("code", MULTISEED_CODE),
+HEADER_PART1_MD = """# SolarSDE Part 1 — Foundations (~9-11 hours)
 
-        ("markdown", "## STAGE D — Standard baselines (persistence, smart-pers, LSTM, MC-Dropout, CSDI)"),
-        ("code", BASELINES_CODE),
+**Run this notebook FIRST.** Produces the Golden CO VAE + latents + Stanford SKIPP'D pipeline.
 
-        ("markdown", "## STAGE E — Extra baselines (Deep Ensemble, TimeGrad, ResNet+Image, SUNSET)"),
-        ("code", EXTRA_BASELINES_CODE),
+## Stages
 
-        ("markdown", "## STAGE F — Ablations A2-A4 (existing) + A5, A7 (new)"),
-        ("code", ABLATIONS_CODE),
-        ("code", EXTRA_ABLATIONS_CODE),
+| Stage | What it does | Est. runtime |
+|-------|--------------|--------------|
+| Retrain (conditional) | Download CloudCV + BMS, preprocess, train Golden VAE, extract latents, physics features, extended splits | ~3h (if nothing cached) |
+| Stage A | Stanford SKIPP'D: download, train VAE, extract latents, train SDE + Score Decoder, evaluate | ~6-8h |
+| Zip | Package all outputs under `/kaggle/working/solarsde_outputs/` | <5 min |
 
-        ("markdown", "## STAGE G — Conformal calibration"),
-        ("code", CALIBRATION_CODE),
+## Kaggle workflow
 
-        ("markdown", "## STAGE H — Stratified evaluation + Diebold-Mariano test"),
-        ("code", STRATIFIED_CODE),
+1. Enable P100 GPU + Internet (Settings panel)
+2. Run all cells. Each sub-stage checkpoints, so partial progress resumes cleanly on re-run.
+3. At the end, go to File → Save Version → Save & Run All. This materializes the output directory as a Kaggle dataset.
+4. In your 07b notebook, use Add Data → Your Datasets to attach the output dataset produced here.
 
-        ("markdown", "## STAGE I — PIT + reliability + sharpness + bootstrap CIs"),
-        ("code", PIT_RELIABILITY_CODE),
-        ("code", BOOTSTRAP_CIS_CODE),
+Once Part 1 finishes, run Part 2 (07b_training.ipynb).
+"""
 
-        ("markdown", "## STAGE J — Cross-site transfer (Golden ↔ Stanford)"),
-        ("code", CROSSSITE_CODE),
+HEADER_PART2_MD = """# SolarSDE Part 2 — Training (~7-10 hours)
 
-        ("markdown", "## STAGE K — Economic value (CAISO reserve simulation)"),
-        ("code", ECONOMIC_CAISO_CODE),
+**Run 07a_foundations FIRST.** This notebook assumes the Golden VAE + latents already exist.
 
-        ("markdown", "## STAGE L — Computational benchmark"),
-        ("code", COMPUTATIONAL_CODE),
+## Stages
 
-        ("markdown", "## STAGE M — Analysis figures (CTI, regime, forecast traces)"),
-        ("code", ANALYSIS_CODE),
+| Stage | What it does | Est. runtime |
+|-------|--------------|--------------|
+| Stage B | Image features on Golden (optical flow + sun-ROI + cloud fraction) | ~30 min |
+| Stage C | Train SolarSDE on Golden (seed 42) — SDE + Score Decoder | ~3-4h |
+| Stage C2 | Re-train with seeds 123 + 456 for mean ± std reporting | ~4-6h |
+| Zip | Package all outputs | <5 min |
 
-        ("markdown", "## STAGE N — Publication figures + LaTeX tables"),
-        ("code", PUB_FIGURES_CODE),
-        ("code", LATEX_TABLES_CODE),
+## Kaggle workflow
 
-        ("markdown", "## Final: zip & download"),
-        ("code", ZIP_DOWNLOAD_CODE),
-    ]
+1. Attach 07a output dataset (Add Data → Your Datasets)
+2. Copy the dataset contents into `/kaggle/working/solarsde_outputs/` (the setup cell does this for common dataset layouts)
+3. Run all cells. Resume-safe.
+4. Save Version → Save & Run All to materialize output.
+5. Run Part 3 (07c_evaluation.ipynb) next.
+"""
+
+HEADER_PART3_MD = """# SolarSDE Part 3 — Evaluation & Figures (~9-12 hours)
+
+**Run 07a_foundations and 07b_training FIRST.** This notebook assumes SDE + Score + Stanford results exist.
+
+## Stages
+
+| Stage | What it does | Est. runtime |
+|-------|--------------|--------------|
+| Stage D | Standard baselines: Persistence, Smart-Pers, LSTM, MC-Dropout, CSDI | ~2-3h |
+| Stage E | Extra baselines: Deep Ensemble (5×), TimeGrad, ResNet+Image, SUNSET | ~4-6h |
+| Stage F | Ablations A2-A5, A7 | ~2-3h |
+| Stage G | Conformal calibration | 10 min |
+| Stage H | Stratified eval + Diebold-Mariano test | 30 min |
+| Stage I | PIT + reliability + sharpness + bootstrap CIs | 30 min |
+| Stage J | Cross-site transfer (Golden ↔ Stanford) | ~1h |
+| Stage K | Economic value (CAISO reserve simulation) | 15 min |
+| Stage L | Computational benchmark (params + inference latency) | 30 min |
+| Stage M | Analysis figures (CTI, regime, forecast traces) | 15 min |
+| Stage N | Publication figures + LaTeX tables | <10 min |
+
+## Kaggle workflow
+
+1. Attach 07a + 07b output datasets
+2. Run all cells. Final cell produces the downloadable zip with all tables + figures.
+"""
+
+
+def part1_nb():
+    """07a — Foundations: Retrain Golden + Stanford pipeline."""
+    cells = (
+        [("markdown", HEADER_PART1_MD)]
+        + _COMMON_PREFIX
+        + _RETRAIN_BLOCK
+        + [
+            ("markdown", "## 2. Load data tensors"),
+            ("code", LOAD_DATA_TOLERANT_CODE),
+            ("markdown", "## STAGE A — Stanford SKIPP'D as full second site"),
+            ("code", STANFORD_FULL_PIPELINE_CODE),
+            ("markdown", "## Final: zip Part 1 outputs"),
+            ("code", ZIP_DOWNLOAD_CODE),
+        ]
+    )
+    return build_nb(cells)
+
+
+def part2_nb():
+    """07b — Training: Image features + Golden SolarSDE training + multi-seed."""
+    cells = (
+        [("markdown", HEADER_PART2_MD)]
+        + _COMMON_PREFIX
+        + [
+            ("markdown", "## Prerequisite check"),
+            ("code", _REQUIRE_FOUNDATIONS_CODE),
+            ("markdown", "## 2. Load data tensors"),
+            ("code", LOAD_DATA_TOLERANT_CODE),
+            ("markdown", "## STAGE B — Image features (Golden: optical flow + sun-ROI + cloud)"),
+            ("code", STAGE_MINUS1_CODE),
+            ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
+            ("code", STAGE0_CODE),
+            ("markdown", "## STAGE C2 — Multi-seed runs (seeds 123, 456) for variance estimation"),
+            ("code", MULTISEED_CODE),
+            ("markdown", "## Final: zip Part 2 outputs"),
+            ("code", ZIP_DOWNLOAD_CODE),
+        ]
+    )
+    return build_nb(cells)
+
+
+def part3_nb():
+    """07c — Evaluation: all baselines + ablations + stats + figures + tables."""
+    cells = (
+        [("markdown", HEADER_PART3_MD)]
+        + _COMMON_PREFIX
+        + [
+            ("markdown", "## Prerequisite check"),
+            ("code", _REQUIRE_FOUNDATIONS_CODE),
+            ("code", _REQUIRE_TRAINING_CODE),
+            ("markdown", "## 2. Load data tensors"),
+            ("code", LOAD_DATA_TOLERANT_CODE),
+            ("markdown", "## STAGE D — Standard baselines"),
+            ("code", BASELINES_CODE),
+            ("markdown", "## STAGE E — Extra baselines (Deep Ensemble, TimeGrad, ResNet+Image, SUNSET)"),
+            ("code", EXTRA_BASELINES_CODE),
+            ("markdown", "## STAGE F — Ablations"),
+            ("code", ABLATIONS_CODE),
+            ("code", EXTRA_ABLATIONS_CODE),
+            ("markdown", "## STAGE G — Conformal calibration"),
+            ("code", CALIBRATION_CODE),
+            ("markdown", "## STAGE H — Stratified evaluation + Diebold-Mariano test"),
+            ("code", STRATIFIED_CODE),
+            ("markdown", "## STAGE I — PIT + reliability + sharpness + bootstrap CIs"),
+            ("code", PIT_RELIABILITY_CODE),
+            ("code", BOOTSTRAP_CIS_CODE),
+            ("markdown", "## STAGE J — Cross-site transfer (Golden ↔ Stanford)"),
+            ("code", CROSSSITE_CODE),
+            ("markdown", "## STAGE K — Economic value (CAISO reserve simulation)"),
+            ("code", ECONOMIC_CAISO_CODE),
+            ("markdown", "## STAGE L — Computational benchmark"),
+            ("code", COMPUTATIONAL_CODE),
+            ("markdown", "## STAGE M — Analysis figures (CTI, regime, forecast traces)"),
+            ("code", ANALYSIS_CODE),
+            ("markdown", "## STAGE N — Publication figures + LaTeX tables"),
+            ("code", PUB_FIGURES_CODE),
+            ("code", LATEX_TABLES_CODE),
+            ("markdown", "## Final: zip & download full paper package"),
+            ("code", ZIP_DOWNLOAD_CODE),
+        ]
+    )
     return build_nb(cells)
 
 
 if __name__ == "__main__":
-    path = NB_DIR / "07_solarsde_final_publication.ipynb"
-    nb = final_nb()
-    path.write_text(json.dumps(nb, indent=1))
-    print(f"Wrote {path.name}: {path.stat().st_size / 1024:.1f} KB ({len(nb['cells'])} cells)")
+    for name, builder in [
+        ("07a_foundations.ipynb", part1_nb),
+        ("07b_training.ipynb",    part2_nb),
+        ("07c_evaluation.ipynb",  part3_nb),
+    ]:
+        path = NB_DIR / name
+        nb = builder()
+        path.write_text(json.dumps(nb, indent=1))
+        print(f"Wrote {name}: {path.stat().st_size / 1024:.1f} KB ({len(nb['cells'])} cells)")
