@@ -32,12 +32,364 @@ sys.path.insert(0, str(NB_DIR))
 # Reuse the foundational blocks already validated in _combined_generator.py
 from _combined_generator import (
     build_nb,
-    SETUP_CODE, FAST_START_CODE, SHARED_CODE, LOAD_DATA_CODE,
+    SETUP_CODE, SHARED_CODE, LOAD_DATA_CODE,
     STAGE_MINUS1_CODE, STAGE0_CODE,
     BASELINES_CODE, ABLATIONS_CODE,
     CALIBRATION_CODE, STRATIFIED_CODE, ANALYSIS_CODE,
     ZIP_DOWNLOAD_CODE,
 )
+# Pull Notebook 1's data download + VAE training blocks for the from-scratch path
+from _generator import (
+    CLOUDCV_DOWNLOAD, CLOUDCV_EXTRACT, BMS_DOWNLOAD, PREPROCESS_CODE,
+    VAE_MODEL, IMAGE_DATASET, VAE_TRAIN, LATENT_EXTRACT,
+)
+
+
+# ================================================================
+# Soft-fail fast-start: pull artifacts if available, never crash.
+# If anything is missing, the from-scratch retrain blocks below will produce it.
+# ================================================================
+
+FAST_START_SOFT_CODE = '''\
+# ==== Soft fast-start: pull cached artifacts from GitHub if available ====
+# Never raises — if anything is missing, the from-scratch stages below will
+# produce it. This block exists purely as a fast path for users who don't
+# want to spend 6+ hours retraining the Golden VAE.
+
+import requests
+GITHUB_RAW = "https://raw.githubusercontent.com/keshavkrishnan08/SDE/main"
+
+def gh_pull_soft(rel_path, dest):
+    if dest.exists() and dest.stat().st_size > 100:
+        return True
+    try:
+        r = requests.get(f"{GITHUB_RAW}/{rel_path}", timeout=180)
+        if r.status_code == 200 and len(r.content) > 100:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(r.content)
+            return True
+    except Exception:
+        pass
+    return False
+
+print("Trying to pull cached upstream artifacts (best-effort, non-blocking) ...")
+required = {
+    CHECKPOINT_DIR / "vae_best.pt":   "colab_outputs/checkpoints/vae_best.pt",
+    SPLITS_DIR    / "train.parquet":  "colab_outputs/splits/train.parquet",
+    SPLITS_DIR    / "val.parquet":    "colab_outputs/splits/val.parquet",
+    SPLITS_DIR    / "test.parquet":   "colab_outputs/splits/test.parquet",
+    EXTENDED_DIR  / "train.parquet":  "colab_outputs/extended/train.parquet",
+    EXTENDED_DIR  / "val.parquet":    "colab_outputs/extended/val.parquet",
+    EXTENDED_DIR  / "test.parquet":   "colab_outputs/extended/test.parquet",
+}
+for split in ["train", "val", "test"]:
+    for key in ["latents", "cti", "ghi", "covariates", "is_ramp", "kt", "ghi_clearsky",
+                "physics_features"]:
+        required[LATENT_DIR / f"{split}_{key}.npy"] = f"colab_outputs/latents/{split}_{key}.npy"
+optional = {
+    CHECKPOINT_DIR / "sde_best.pt":   "colab_outputs/checkpoints/sde_best.pt",
+    CHECKPOINT_DIR / "score_best.pt": "colab_outputs/checkpoints/score_best.pt",
+}
+n_pulled, n_missing = 0, 0
+for dest, rel in {**required, **optional}.items():
+    if gh_pull_soft(rel, dest):
+        if dest.exists():
+            n_pulled += 1
+    else:
+        n_missing += 1
+
+print(f"  pulled/already-present: {n_pulled}    missing: {n_missing}")
+HAVE_VAE = (CHECKPOINT_DIR / "vae_best.pt").exists()
+HAVE_SPLITS = (SPLITS_DIR / "train.parquet").exists()
+HAVE_LATENTS = all((LATENT_DIR / f"{s}_latents.npy").exists() for s in ["train", "val", "test"])
+HAVE_KT = all((LATENT_DIR / f"{s}_kt.npy").exists() for s in ["train", "val", "test"])
+HAVE_PHYS = all((LATENT_DIR / f"{s}_physics_features.npy").exists() for s in ["train", "val", "test"])
+HAVE_EXTENDED = (EXTENDED_DIR / "train.parquet").exists()
+
+print(f"\\nState of upstream artifacts:")
+print(f"  VAE checkpoint:      {HAVE_VAE}")
+print(f"  Splits parquets:     {HAVE_SPLITS}")
+print(f"  Latents (z+cti):     {HAVE_LATENTS}")
+print(f"  kt + ghi_clearsky:   {HAVE_KT}")
+print(f"  Physics features:    {HAVE_PHYS}")
+print(f"  Extended parquets:   {HAVE_EXTENDED}")
+
+NEED_GOLDEN_RETRAIN = not (HAVE_VAE and HAVE_SPLITS and HAVE_LATENTS and HAVE_KT and HAVE_PHYS)
+if NEED_GOLDEN_RETRAIN:
+    print("\\n[INFO] Some Golden artifacts missing — RETRAIN_GOLDEN stage will produce them.")
+else:
+    print("\\n[INFO] All Golden artifacts present — RETRAIN_GOLDEN stage will skip.")
+'''
+
+
+# ================================================================
+# RETRAIN_GOLDEN_CODE — full Notebook 1 pipeline run inline if anything missing
+# ================================================================
+
+RETRAIN_GOLDEN_CODE = '''\
+# ==== RETRAIN GOLDEN PIPELINE (download + preprocess + VAE + latents) ====
+# Runs only if NEED_GOLDEN_RETRAIN was set True by the soft fast-start above.
+# Each sub-step is itself idempotent (skips if its output already exists).
+#
+# Estimated time on a P100 / T4 GPU:
+#   CloudCV download (~2.6 GB):    20-40 min
+#   BMS download:                   2 min
+#   Preprocess + splits:            5 min
+#   VAE training (20 epochs):       1-2 hr
+#   Latent extraction:              10-15 min
+#   kt / ghi_clearsky save:         <1 min
+#   Physics feature computation:    5 min
+#                                   ----
+#   Total Golden retrain:           ~3 hours
+
+if not NEED_GOLDEN_RETRAIN:
+    print("[SKIP] Golden retrain not needed — all artifacts present.")
+'''
+
+# Note: the conditional retrain wraps the Notebook 1 blocks below, but we
+# keep them as separate cells so progress prints are clear. Each block has
+# its own `if X.exists(): skip` guards.
+
+
+GOLDEN_KT_PHYS_CODE = '''\
+# ==== Save kt + ghi_clearsky + physics features for each split ====
+# Required by LOAD_DATA: kt, ghi_clearsky come from the parquet columns.
+# Physics features (15-dim) are computed inline from the split parquets.
+
+import numpy as np, pandas as pd
+
+ALL_KT_DONE = all((LATENT_DIR / f"{s}_kt.npy").exists() and
+                  (LATENT_DIR / f"{s}_ghi_clearsky.npy").exists()
+                  for s in ["train", "val", "test"])
+if ALL_KT_DONE:
+    print("[SKIP] kt + ghi_clearsky already saved.")
+else:
+    print("Saving kt + ghi_clearsky from split parquets ...")
+    for split in ["train", "val", "test"]:
+        df = pd.read_parquet(SPLITS_DIR / f"{split}.parquet")
+        if "image_exists" in df.columns:
+            df = df[df["image_exists"]].reset_index(drop=True)
+        kt = df["clear_sky_index"].values.astype(np.float32)
+        gcs = df["ghi_clearsky"].values.astype(np.float32)
+        np.save(LATENT_DIR / f"{split}_kt.npy", kt)
+        np.save(LATENT_DIR / f"{split}_ghi_clearsky.npy", gcs)
+        print(f"  {split}: kt range [{kt.min():.3f}, {kt.max():.3f}], gcs range [{gcs.min():.1f}, {gcs.max():.1f}]")
+
+ALL_PHYS_DONE = all((LATENT_DIR / f"{s}_physics_features.npy").exists()
+                    for s in ["train", "val", "test"])
+if ALL_PHYS_DONE:
+    print("[SKIP] Physics features already computed.")
+else:
+    print("\\nComputing physics features (15-dim per row) ...")
+    def compute_physics_15(df):
+        df = df.reset_index(drop=True).copy()
+        n = len(df)
+        zenith = df["solar_zenith"].values.astype(np.float32)
+        zenith_clip = np.clip(zenith, 0, 89.9)
+        zenith_rad = np.deg2rad(zenith_clip)
+        air_mass = 1.0 / (np.cos(zenith_rad) + 0.50572 * (96.07995 - zenith_clip) ** -1.6364)
+        air_mass = np.clip(air_mass, 1.0, 40.0).astype(np.float32)
+        zenith_rate = np.zeros(n, dtype=np.float32)
+        zenith_rate[1:] = (zenith[1:] - zenith[:-1]) / 10.0
+        az = df.get("solar_azimuth", pd.Series(np.zeros(n))).values.astype(np.float32)
+        az_rad = np.deg2rad(az)
+        ts = pd.to_datetime(df["timestamp"])
+        hour_frac = (ts.dt.hour + ts.dt.minute / 60.0 + ts.dt.second / 3600.0).values
+        doy = ts.dt.dayofyear.values
+        kt = df["clear_sky_index"].values.astype(np.float32)
+        def trend(s, lag):
+            o = np.zeros_like(s); o[lag:] = (s[lag:] - s[:-lag]) / lag; return o
+        def rstd(s, w):
+            o = np.zeros_like(s)
+            for i in range(w, len(s)):
+                o[i] = np.std(s[i-w:i])
+            return o
+        ghi = df["ghi"].values.astype(np.float32)
+        pyr = df["millivolts"].values.astype(np.float32) if "millivolts" in df.columns else np.zeros(n, np.float32)
+        return np.stack([
+            air_mass, zenith_rate,
+            np.sin(az_rad).astype(np.float32), np.cos(az_rad).astype(np.float32),
+            np.sin(2*np.pi*hour_frac/24).astype(np.float32),
+            np.cos(2*np.pi*hour_frac/24).astype(np.float32),
+            np.sin(2*np.pi*doy/365.25).astype(np.float32),
+            np.cos(2*np.pi*doy/365.25).astype(np.float32),
+            np.clip((hour_frac - 6.0) / 12.0, 0, 1).astype(np.float32),
+            trend(kt, 6), trend(kt, 30), trend(kt, 60),
+            rstd(kt, 30).astype(np.float32),
+            (rstd(ghi, 6) / 1200.0).astype(np.float32),
+            pyr,
+        ], axis=1)
+    for split in ["train", "val", "test"]:
+        df = pd.read_parquet(SPLITS_DIR / f"{split}.parquet")
+        if "image_exists" in df.columns:
+            df = df[df["image_exists"]].reset_index(drop=True)
+        feats = compute_physics_15(df)
+        np.save(LATENT_DIR / f"{split}_physics_features.npy", feats)
+        print(f"  {split}: physics features shape={feats.shape}")
+'''
+
+
+GOLDEN_EXTENDED_CODE = '''\
+# ==== Build extended (90-day BMS-only) splits for LSTM baselines ====
+# These provide ~12x more training data for the LSTM/MC-Dropout/Deep-Ensemble/
+# TimeGrad baselines. Without them, baselines train on only ~5 days of 10s data.
+
+if HAVE_EXTENDED:
+    print("[SKIP] Extended splits already present.")
+else:
+    print("Building extended (90-day BMS-only) splits ...")
+    import pandas as pd, numpy as np
+
+    BMS_PATH = DATA_DIR / "bms" / "bms_srrl_2019.csv"
+    if not BMS_PATH.exists():
+        print("[WARN] BMS data not present — extended splits cannot be built.")
+        print("       Re-run BMS_DOWNLOAD cell first, or LSTM baselines will be limited.")
+    else:
+        try:
+            import pvlib
+            from pvlib.location import Location
+        except ImportError:
+            pip_install("pvlib")
+            import pvlib
+            from pvlib.location import Location
+        SRRL = Location(latitude=39.742, longitude=-105.18, tz="America/Denver",
+                        altitude=1829, name="NREL SRRL")
+
+        bms_raw = pd.read_csv(BMS_PATH)
+        from datetime import datetime
+        ts_list = []
+        for _, r in bms_raw.iterrows():
+            try:
+                y, doy, mst = int(r["Year"]), int(r["DOY"]), int(r["MST"])
+                hh, mm = divmod(mst, 100)
+                dt = datetime.strptime(f"{y}-{doy}", "%Y-%j").replace(hour=hh, minute=mm)
+                ts_list.append(dt)
+            except Exception:
+                ts_list.append(pd.NaT)
+        bms_raw["timestamp"] = pd.to_datetime(ts_list)
+        bms_raw = bms_raw.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        cols_map = {
+            "ghi": "Global LI-200 [W/m^2]",
+            "dni": "Direct NIP [W/m^2]",
+            "dhi": "Diffuse CM22-1 (vent/cor) [W/m^2]",
+            "temperature": "Deck Dry Bulb Temp [deg C]",
+            "humidity":    "Deck RH [%]",
+            "wind_speed":  "Avg Wind Speed @ 19ft [m/s]",
+            "millivolts":  "Global LI-200 [W/m^2]",
+        }
+        out = pd.DataFrame({"timestamp": bms_raw["timestamp"]})
+        for k, src in cols_map.items():
+            out[k] = pd.to_numeric(bms_raw.get(src), errors="coerce").replace(
+                [-7999, -6999, -9999], np.nan)
+        out["ghi"] = out["ghi"].clip(lower=0)
+        out = out.dropna(subset=["ghi"]).reset_index(drop=True)
+
+        # Solar geometry + clear sky
+        tz_ts = pd.DatetimeIndex(out["timestamp"]).tz_localize("America/Denver")
+        sp = SRRL.get_solarposition(tz_ts)
+        out["solar_zenith"] = sp["apparent_zenith"].values
+        out["solar_azimuth"] = sp["azimuth"].values
+        cs = SRRL.get_clearsky(tz_ts, model="ineichen")
+        out["ghi_clearsky"] = cs["ghi"].values
+        out["clear_sky_index"] = np.clip(out["ghi"] / out["ghi_clearsky"].replace(0, np.nan), 0, 1.5).fillna(0)
+        out = out[out["solar_zenith"] <= 85.0].reset_index(drop=True)
+        out["is_ramp"] = (out["ghi"].diff(1).abs() > 50.0).fillna(False)
+
+        # Chronological 60/15/15 split by date
+        dates = sorted(out["timestamp"].dt.date.unique())
+        n_tr = int(len(dates) * 0.7); n_val = int(len(dates) * 0.15)
+        tr_set = set(dates[:n_tr]); va_set = set(dates[n_tr:n_tr+n_val])
+        ext_tr = out[out["timestamp"].dt.date.isin(tr_set)].reset_index(drop=True)
+        ext_va = out[out["timestamp"].dt.date.isin(va_set)].reset_index(drop=True)
+        ext_te = out[~out["timestamp"].dt.date.isin(tr_set | va_set)].reset_index(drop=True)
+        ext_tr.to_parquet(EXTENDED_DIR / "train.parquet")
+        ext_va.to_parquet(EXTENDED_DIR / "val.parquet")
+        ext_te.to_parquet(EXTENDED_DIR / "test.parquet")
+        print(f"  extended: train={len(ext_tr):,}  val={len(ext_va):,}  test={len(ext_te):,}")
+'''
+
+
+LOAD_DATA_TOLERANT_CODE = '''\
+# ==== Load all data tensors (tolerant: degrades gracefully if extended missing) ====
+def load_split(s):
+    orig_cov = np.load(LATENT_DIR / f"{s}_covariates.npy")
+    phys = np.load(LATENT_DIR / f"{s}_physics_features.npy")
+    img_feat_path = LATENT_DIR / f"{s}_image_features.npy"
+    if img_feat_path.exists():
+        img_feats = np.load(img_feat_path)
+        cov = np.concatenate([orig_cov, phys, img_feats], axis=1).astype(np.float32)
+    else:
+        cov = np.concatenate([orig_cov, phys], axis=1).astype(np.float32)
+    return {
+        "Z":    np.load(LATENT_DIR / f"{s}_latents.npy"),
+        "cti":  np.load(LATENT_DIR / f"{s}_cti.npy"),
+        "ghi":  np.load(LATENT_DIR / f"{s}_ghi.npy"),
+        "cov":  cov,
+        "ramp": np.load(LATENT_DIR / f"{s}_is_ramp.npy"),
+        "kt":   np.load(LATENT_DIR / f"{s}_kt.npy"),
+        "gcs":  np.load(LATENT_DIR / f"{s}_ghi_clearsky.npy"),
+    }
+data = {s: load_split(s) for s in ["train", "val", "test"]}
+print(f"\\n  Covariate dim: {data['train']['cov'].shape[1]}  "
+      f"(5 original + 15 physics + "
+      f"{data['train']['cov'].shape[1] - 20} image features)")
+for s, d in data.items():
+    print(f"  {s}: Z={d['Z'].shape}, GHI=[{d['ghi'].min():.0f},{d['ghi'].max():.0f}], ramps={int(d['ramp'].sum())}")
+
+train_df = pd.read_parquet(SPLITS_DIR / "train.parquet")
+val_df   = pd.read_parquet(SPLITS_DIR / "val.parquet")
+test_df  = pd.read_parquet(SPLITS_DIR / "test.parquet")
+print(f"\\n8-day image splits: train={len(train_df):,} val={len(val_df):,} test={len(test_df):,}")
+
+# Extended (90-day BMS) splits — used by LSTM/MC-Dropout/TimeGrad/Deep-Ensemble baselines.
+# If missing, we fall back to using the regular train_df/val_df for those baselines.
+HAVE_EXT = (EXTENDED_DIR / "train.parquet").exists() and (EXTENDED_DIR / "val.parquet").exists()
+if HAVE_EXT:
+    ext_train = pd.read_parquet(EXTENDED_DIR / "train.parquet")
+    ext_val   = pd.read_parquet(EXTENDED_DIR / "val.parquet")
+    print(f"90-day extended:    train={len(ext_train):,} val={len(ext_val):,}")
+else:
+    print("[WARN] Extended (90-day BMS) parquets missing — LSTM baselines will train on the")
+    print("       8-day image splits instead, with reduced sample count.")
+    # Fallback: replicate the structure expected by BASELINES_CODE
+    ext_train = train_df.copy()
+    ext_val   = val_df.copy()
+
+Z_DIM = data["train"]["Z"].shape[1]
+C_DIM = max(1, data["train"]["cov"].shape[1])
+print(f"\\nZ_DIM={Z_DIM}, C_DIM={C_DIM}")
+
+HORIZONS = [6, 30, 60, 120, 180]
+HORIZON_MIN = {6: 1, 30: 5, 60: 10, 120: 20, 180: 30}
+N_SAMPLES = 50
+N_EVAL = min(1000, len(data["test"]["Z"]) - max(HORIZONS) - 1)
+SEQ_LEN = 30
+print(f"Horizons: {list(HORIZON_MIN.values())} min, MC samples: {N_SAMPLES}, N_EVAL: {N_EVAL}")
+'''
+
+
+GOLDEN_RETRAIN_GUARD_CODE = '''\
+# ==== Conditional guards on the Golden retrain blocks below ====
+# Each Notebook 1 block (CLOUDCV_DOWNLOAD/EXTRACT/BMS/PREPROCESS/VAE/LATENT)
+# has its own internal "skip if output exists" check. The wrapper here just
+# documents the intent and lets you skip the whole stage with one toggle.
+
+ENABLE_GOLDEN_RETRAIN = NEED_GOLDEN_RETRAIN   # auto-detected by fast-start
+if not ENABLE_GOLDEN_RETRAIN:
+    print("[SKIP] Golden retrain disabled (all artifacts present).")
+'''
+
+
+# ================================================================
+# Helper: wrap a Notebook 1 code block in `if <gate>:` so it runs
+# conditionally. Indents the block body by 4 spaces.
+# ================================================================
+
+def _gate(condition: str, body: str) -> str:
+    """Wrap body in `if <condition>:` with 4-space indent on every line."""
+    indented = "\n".join("    " + ln if ln.strip() else "" for ln in body.splitlines())
+    return f"if {condition}:\n{indented}\n"
 
 
 # ================================================================
@@ -470,7 +822,7 @@ else:
                 truths.append(sf_pv_te[i + h])
             preds = np.array(preds_all)         # (N_obs, N_samples)
             tru = np.array(truths)              # (N_obs,)
-            crps = crps_ensemble(preds, tru).mean()
+            crps = crps_empirical(tru, preds).mean()
             rmse = np.sqrt(((preds.mean(1) - tru) ** 2).mean())
             picp = ((np.percentile(preds, 5, axis=1) <= tru) &
                     (tru <= np.percentile(preds, 95, axis=1))).mean()
@@ -609,7 +961,7 @@ def _train_and_eval_seed(seed):
                 ghi_pred = kt_pred * te["gcs"][i:end][:, None]
                 preds_l.append(ghi_pred); truths_l.append(te["ghi"][i + h:end + h])
             preds = np.concatenate(preds_l, axis=0); tru = np.concatenate(truths_l)
-            crps = crps_ensemble(preds, tru).mean()
+            crps = crps_empirical(tru, preds).mean()
             rmse = float(np.sqrt(((preds.mean(1) - tru) ** 2).mean()))
             picp = float(((np.percentile(preds, 5, axis=1) <= tru) &
                           (tru <= np.percentile(preds, 95, axis=1))).mean())
@@ -686,7 +1038,7 @@ else:
     if "preds" in pred_npz.files and "truths" in pred_npz.files:
         preds = pred_npz["preds"]      # (N, S)
         tru = pred_npz["truths"]       # (N,)
-        ps_crps = np.array([crps_ensemble(preds[i:i+1], tru[i:i+1])[0] for i in range(len(tru))])
+        ps_crps = np.array([crps_empirical(tru[i:i+1], preds[i:i+1])[0] for i in range(len(tru))])
         ps_mae = np.abs(preds.mean(1) - tru)
         ps_se = (preds.mean(1) - tru) ** 2
         crps_mu, crps_lo, crps_hi = bootstrap_ci(ps_crps)
@@ -797,7 +1149,7 @@ else:
     sharp_rows = []
     for name, preds in preds_dict.items():
         sh = sharpness(preds, level=0.9)
-        cr = float(crps_ensemble(preds, truth).mean())
+        cr = float(crps_empirical(truth, preds).mean())
         sharp_rows.append({"model": name, "horizon_min": 10, "sharpness_90": sh, "crps": cr})
         axes[2].scatter(sh, cr, label=name, s=80, alpha=0.8)
         axes[2].annotate(name, (sh, cr), fontsize=8, xytext=(5, 5), textcoords="offset points")
@@ -863,7 +1215,7 @@ else:
                 preds_all.append(ghi_pred); truths_all.append(te["ghi"][i + h:end + h])
             preds = np.concatenate(preds_all, axis=0); yt = np.concatenate(truths_all)
             m = {
-                "crps": float(crps_ensemble(preds, yt).mean()),
+                "crps": float(crps_empirical(yt, preds).mean()),
                 "rmse": float(np.sqrt(((preds.mean(1) - yt) ** 2).mean())),
                 "picp": float(((np.percentile(preds, 5, axis=1) <= yt) &
                                (yt <= np.percentile(preds, 95, axis=1))).mean()),
@@ -992,7 +1344,7 @@ else:
                     preds_all.append(ghi_pred); truths_all.append(te["ghi"][i + h:end + h])
                 preds = np.concatenate(preds_all, axis=0); yt = np.concatenate(truths_all)
                 m = {
-                    "crps": float(crps_ensemble(preds, yt).mean()),
+                    "crps": float(crps_empirical(yt, preds).mean()),
                     "rmse": float(np.sqrt(((preds.mean(1) - yt) ** 2).mean())),
                     "picp": float(((np.percentile(preds, 5, axis=1) <= yt) &
                                    (yt <= np.percentile(preds, 95, axis=1))).mean()),
@@ -1182,7 +1534,7 @@ else:
         yt = Yte_x[:, hi]
         m = {
             "horizon_min": HORIZON_MIN[h], "horizon_steps": h, "n_eval": len(yt),
-            "crps": float(crps_ensemble(preds_h, yt).mean()),
+            "crps": float(crps_empirical(yt, preds_h).mean()),
             "rmse": float(np.sqrt(((preds_h.mean(1) - yt) ** 2).mean())),
             "picp": float(((np.percentile(preds_h, 5, axis=1) <= yt) &
                            (yt <= np.percentile(preds_h, 95, axis=1))).mean()),
@@ -1280,7 +1632,7 @@ else:
             preds = np.concatenate(preds_l, axis=0); yt = np.concatenate(truths_l)
             m = {
                 "horizon_min": HORIZON_MIN[h], "horizon_steps": h, "n_eval": len(yt),
-                "crps": float(crps_ensemble(preds, yt).mean()),
+                "crps": float(crps_empirical(yt, preds).mean()),
                 "rmse": float(np.sqrt(((preds.mean(1) - yt) ** 2).mean())),
                 "picp": float(((np.percentile(preds, 5, axis=1) <= yt) &
                                (yt <= np.percentile(preds, 95, axis=1))).mean()),
@@ -1534,7 +1886,7 @@ else:
             pv_pred = kt_pred * sf_pv_scale
             preds_l.append(pv_pred); truths_l.append(sf_pv[i + H_TRANS:end + H_TRANS])
         preds = np.concatenate(preds_l, axis=0); yt = np.concatenate(truths_l)
-        crps = float(crps_ensemble(preds, yt).mean())
+        crps = float(crps_empirical(yt, preds).mean())
         rmse = float(np.sqrt(((preds.mean(1) - yt) ** 2).mean()))
         rows.append({"setting": "Zero-shot Golden->Stanford", "horizon_min": H_TRANS, "crps_kW": crps, "rmse_kW": rmse})
         print(f"  Zero-shot Golden->Stanford @ h={H_TRANS}min: CRPS={crps:.3f} kW  RMSE={rmse:.3f} kW")
@@ -1749,10 +2101,33 @@ def final_nb():
         ("markdown", HEADER_FINAL_MD),
         ("markdown", "## 0. Setup"),
         ("code", SETUP_CODE),
-        ("code", FAST_START_CODE),
+        ("code", FAST_START_SOFT_CODE),
+
         ("markdown", "## 1. Shared model definitions"),
         ("code", SHARED_CODE),
-        ("code", LOAD_DATA_CODE),
+
+        ("markdown", "## RETRAIN — Golden CO from raw data (skipped if all artifacts already present)"),
+        ("code", GOLDEN_RETRAIN_GUARD_CODE),
+        # VAE class definitions ALWAYS run so latent extraction / param counting work
+        # even when training is skipped:
+        ("code", "LATENT_DIM = 64\nIMG_SIZE = 128\n" + VAE_MODEL),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not all((DATA_DIR / 'cloudcv' / f).exists() "
+                       "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (DATA_DIR / 'bms' / 'bms_srrl_2019.csv').exists()",
+                       BMS_DOWNLOAD)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (SPLITS_DIR / 'train.parquet').exists()",
+                       PREPROCESS_CODE)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN", IMAGE_DATASET)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (CHECKPOINT_DIR / 'vae_best.pt').exists()",
+                       VAE_TRAIN)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (LATENT_DIR / 'test_latents.npy').exists()",
+                       LATENT_EXTRACT)),
+        ("code", GOLDEN_KT_PHYS_CODE),
+        ("code", GOLDEN_EXTENDED_CODE),
+
+        ("markdown", "## 2. Load data tensors (tolerant: warns if extended splits missing)"),
+        ("code", LOAD_DATA_TOLERANT_CODE),
 
         ("markdown", "## STAGE A — Stanford SKIPP'D as full second site"),
         ("code", STANFORD_FULL_PIPELINE_CODE),
