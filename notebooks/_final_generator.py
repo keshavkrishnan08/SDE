@@ -205,6 +205,38 @@ else:
     print(f"  PV scale (99th pct): {SF_PV_SCALE:.2f} kW")
     np.save(SF_LATENTS_DIR / "pv_scale.npy", np.array([SF_PV_SCALE]))
 
+    # ---- VAE architecture (inline, matches Notebook 1's STAGE_MINUS2 VAE) ----
+    class _SfEnc(nn.Module):
+        def __init__(self, latent=64, ch=(32, 64, 128, 256)):
+            super().__init__(); L, ic = [], 3
+            for c in ch:
+                L += [nn.Conv2d(ic, c, 4, 2, 1), nn.GroupNorm(min(32, c), c), nn.SiLU(inplace=True)]
+                ic = c
+            self.conv = nn.Sequential(*L); self.pool = nn.AdaptiveAvgPool2d(1)
+            self.fc_mu = nn.Linear(ch[-1], latent); self.fc_lv = nn.Linear(ch[-1], latent)
+        def forward(self, x):
+            h = self.pool(self.conv(x)).flatten(1); return self.fc_mu(h), self.fc_lv(h)
+    class _SfDec(nn.Module):
+        def __init__(self, latent=64, ch=(256, 128, 64, 32)):
+            super().__init__(); self.init_ch = ch[0]
+            self.fc = nn.Linear(latent, ch[0] * 8 * 8); L = []
+            for i in range(len(ch) - 1):
+                L += [nn.ConvTranspose2d(ch[i], ch[i+1], 4, 2, 1),
+                      nn.GroupNorm(min(32, ch[i+1]), ch[i+1]), nn.SiLU(inplace=True)]
+            L += [nn.ConvTranspose2d(ch[-1], 3, 4, 2, 1), nn.Sigmoid()]
+            self.deconv = nn.Sequential(*L)
+        def forward(self, z): return self.deconv(self.fc(z).view(-1, self.init_ch, 8, 8))
+    class _SfVAE(nn.Module):
+        def __init__(self, latent=64, beta=0.1):
+            super().__init__(); self.beta = beta
+            self.encoder = _SfEnc(latent); self.decoder = _SfDec(latent)
+        def forward(self, x):
+            mu, lv = self.encoder(x); z = mu + torch.exp(0.5 * lv) * torch.randn_like(mu)
+            return self.decoder(z), mu, lv
+        def loss(self, x, rec, mu, lv):
+            r = F.mse_loss(rec, x); k = -0.5 * torch.mean(1 + lv - mu.pow(2) - lv.exp())
+            return r + self.beta * k
+
     # ---- A.3 Train Stanford VAE (independent) ----
     if not SF_VAE_CKPT.exists():
         print("[A.3] Training Stanford VAE (30 epochs, 128x128 upsampled) ...")
@@ -221,7 +253,7 @@ else:
         ds = SfVAEDS(sf_train_imgs[train_mask])
         dl = DataLoader(ds, batch_size=64, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
         torch.manual_seed(42)
-        vae = CloudStateVAE(latent_dim=64, beta=0.1).to(DEVICE)
+        vae = _SfVAE(latent=64, beta=0.1).to(DEVICE)
         opt = torch.optim.Adam(vae.parameters(), lr=1e-4)
         best = float("inf")
         for ep in range(1, 31):
@@ -229,10 +261,10 @@ else:
             for img in dl:
                 img = img.to(DEVICE, non_blocking=True)
                 recon, mu, lv = vae(img)
-                losses = vae.loss(img, recon, mu, lv)
-                opt.zero_grad(); losses["loss"].backward()
+                loss = vae.loss(img, recon, mu, lv)
+                opt.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(vae.parameters(), 1.0); opt.step()
-                tl += losses["loss"].item(); n += 1
+                tl += loss.item(); n += 1
             tl /= n
             print(f"  ep {ep}/30: loss={tl:.4f}")
             if tl < best:
@@ -245,7 +277,7 @@ else:
     # ---- A.4 Encode Stanford latents + CTI per split ----
     if not (SF_LATENTS_DIR / "test_latents.npy").exists():
         print("[A.4] Encoding Stanford latents + CTI ...")
-        vae = CloudStateVAE(latent_dim=64).to(DEVICE)
+        vae = _SfVAE(latent=64).to(DEVICE)
         vae.load_state_dict(torch.load(SF_VAE_CKPT, map_location=DEVICE, weights_only=False))
         vae.eval()
 
@@ -310,7 +342,7 @@ else:
         sf_cov_val = np.load(SF_LATENTS_DIR / "val_covariates.npy")
 
         # SDE — same architecture, dt=60s for Stanford (1-min sampling)
-        sf_sde = LatentSDE(latent_dim=64, c_dim=sf_cov_tr.shape[1]).to(DEVICE)
+        sf_sde = LatentNeuralSDE(z_dim=64, c_dim=sf_cov_tr.shape[1]).to(DEVICE)
         opt_sde = torch.optim.Adam(sf_sde.parameters(), lr=5e-4)
 
         # Mixed-horizon dataset
@@ -405,7 +437,7 @@ else:
     sf_kt_te = np.load(SF_LATENTS_DIR / "test_kt.npy")
     sf_cov_te = np.load(SF_LATENTS_DIR / "test_covariates.npy")
 
-    sf_sde = LatentSDE(latent_dim=64, c_dim=sf_cov_te.shape[1]).to(DEVICE)
+    sf_sde = LatentNeuralSDE(z_dim=64, c_dim=sf_cov_te.shape[1]).to(DEVICE)
     sf_sde.load_state_dict(torch.load(SF_SDE_CKPT, map_location=DEVICE, weights_only=False))
     sf_sde.eval()
     sf_score = CondScoreDecoder(z_dim=64, c_dim=sf_cov_te.shape[1], predict_mode='delta').to(DEVICE)
@@ -496,7 +528,7 @@ def _train_and_eval_seed(seed):
     mh = MHDS(tr, seed=seed)
     dl = DataLoader(mh, batch_size=512, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 
-    sde_s = LatentSDE(latent_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    sde_s = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
     opt = torch.optim.Adam(sde_s.parameters(), lr=5e-4)
     for ep in range(1, 31):
         sde_s.train(); n = 0; tl = 0
@@ -800,7 +832,7 @@ if A7_OUT.exists():
     print("[SKIP] A7 already done.")
 else:
     print("=" * 70); print("ABLATION A7: SolarSDE with covariates c_t = 0"); print("=" * 70)
-    sde_a7 = LatentSDE(latent_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    sde_a7 = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
     sde_a7.load_state_dict(torch.load(CHECKPOINT_DIR / "sde_best.pt", map_location=DEVICE, weights_only=False))
     sde_a7.eval()
     score_a7 = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
@@ -923,7 +955,7 @@ else:
         # Quick proxy A3: replace z in SDE call with PCA z, keep trained decoder
         # (decoder was trained on VAE latents, so mismatch — this mismatch IS the
         # A3 result: shows VAE latents matter).
-        sde_vae = LatentSDE(latent_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+        sde_vae = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
         sde_vae.load_state_dict(torch.load(CHECKPOINT_DIR / "sde_best.pt", map_location=DEVICE, weights_only=False))
         sde_vae.eval()
         score_vae = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
@@ -989,9 +1021,37 @@ def count_params(m):
 
 bench_rows = []
 
-vae_main = CloudStateVAE(latent_dim=Z_DIM).to(DEVICE)
-vae_main.load_state_dict(torch.load(CHECKPOINT_DIR / "vae_best.pt", map_location=DEVICE, weights_only=False))
-sde_main = LatentSDE(latent_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+# Inline CS-VAE for param counting (matches Notebook 1 architecture)
+class _CmpEnc(nn.Module):
+    def __init__(self, latent=64, ch=(32, 64, 128, 256)):
+        super().__init__(); L, ic = [], 3
+        for c in ch:
+            L += [nn.Conv2d(ic, c, 4, 2, 1), nn.GroupNorm(min(32, c), c), nn.SiLU(inplace=True)]
+            ic = c
+        self.conv = nn.Sequential(*L); self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc_mu = nn.Linear(ch[-1], latent); self.fc_lv = nn.Linear(ch[-1], latent)
+    def forward(self, x):
+        h = self.pool(self.conv(x)).flatten(1); return self.fc_mu(h), self.fc_lv(h)
+class _CmpDec(nn.Module):
+    def __init__(self, latent=64, ch=(256, 128, 64, 32)):
+        super().__init__(); self.init_ch = ch[0]
+        self.fc = nn.Linear(latent, ch[0] * 8 * 8); L = []
+        for i in range(len(ch) - 1):
+            L += [nn.ConvTranspose2d(ch[i], ch[i+1], 4, 2, 1),
+                  nn.GroupNorm(min(32, ch[i+1]), ch[i+1]), nn.SiLU(inplace=True)]
+        L += [nn.ConvTranspose2d(ch[-1], 3, 4, 2, 1), nn.Sigmoid()]
+        self.deconv = nn.Sequential(*L)
+    def forward(self, z): return self.deconv(self.fc(z).view(-1, self.init_ch, 8, 8))
+class _CmpVAE(nn.Module):
+    def __init__(self, latent=64):
+        super().__init__()
+        self.encoder = _CmpEnc(latent); self.decoder = _CmpDec(latent)
+vae_main = _CmpVAE(latent=Z_DIM).to(DEVICE)
+try:
+    vae_main.load_state_dict(torch.load(CHECKPOINT_DIR / "vae_best.pt", map_location=DEVICE, weights_only=False))
+except Exception as _e:
+    print(f"  [WARN] could not load vae_best.pt ({_e}); reporting fresh-init param counts.")
+sde_main = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
 sde_main.load_state_dict(torch.load(CHECKPOINT_DIR / "sde_best.pt", map_location=DEVICE, weights_only=False))
 score_main = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
 score_main.load_state_dict(torch.load(CHECKPOINT_DIR / "score_best.pt", map_location=DEVICE, weights_only=False))
@@ -1429,7 +1489,7 @@ elif not SF_LATENTS_DIR_X.exists() or not (SF_LATENTS_DIR_X / "test_latents.npy"
 else:
     print("=" * 70); print("CROSS-SITE TRANSFER (Golden -> Stanford)"); print("=" * 70)
     # Load Golden-trained models
-    sde_g = LatentSDE(latent_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    sde_g = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
     sde_g.load_state_dict(torch.load(CHECKPOINT_DIR / "sde_best.pt", map_location=DEVICE, weights_only=False))
     sde_g.eval()
     score_g = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
