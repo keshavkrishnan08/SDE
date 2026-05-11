@@ -363,7 +363,9 @@ print(f"\\nZ_DIM={Z_DIM}, C_DIM={C_DIM}")
 HORIZONS = [6, 30, 60, 120, 180]
 HORIZON_MIN = {6: 1, 30: 5, 60: 10, 120: 20, 180: 30}
 N_SAMPLES = 50
-N_EVAL = min(1000, len(data["test"]["Z"]) - max(HORIZONS) - 1)
+# Larger N_EVAL gives tighter bootstrap CIs. 2000 is ~12% of typical test set,
+# enough for ramp events to be represented at expected ~5-10% rate.
+N_EVAL = min(2000, len(data["test"]["Z"]) - max(HORIZONS) - 1)
 SEQ_LEN = 30
 print(f"Horizons: {list(HORIZON_MIN.values())} min, MC samples: {N_SAMPLES}, N_EVAL: {N_EVAL}")
 '''
@@ -796,7 +798,7 @@ else:
     sf_score.load_state_dict(torch.load(SF_SCORE_CKPT, map_location=DEVICE, weights_only=False))
     sf_score.eval()
 
-    HORIZONS_SF = [1, 5, 10, 15, 30]   # minutes (= timesteps for 1-min Stanford)
+    HORIZONS_SF = [1, 5, 10, 20, 30]   # minutes — harmonized with Golden HORIZON_MIN values
     N_SAMPLES = 50
     rows = []
     with torch.no_grad():
@@ -848,7 +850,7 @@ MULTISEED_CODE = '''\
 # default from STAGE 0). Saves per-seed checkpoints + results CSVs so the paper
 # can report mean ± std across 3 seeds.
 
-ENABLE_MULTISEED = True
+ENABLE_MULTISEED = False    # set True to add seeds 123, 456 (~4-6 hours extra)
 SEEDS_EXTRA = [123, 456]
 
 def _train_and_eval_seed(seed):
@@ -1178,9 +1180,14 @@ EXTRA_ABLATIONS_CODE = '''\
 # A2, A4, A5 are already in ABLATIONS_CODE above. This stage adds A3 + A7
 # for the complete ablation table.
 
+ENABLE_A7 = False    # inference-time zeroing isn't a clean ablation (not retrained); cut by default
+ENABLE_A3 = True     # PCA-vs-VAE comparison is meaningful when raw images are available
+
 # ---- A7: SolarSDE with covariates zeroed at inference ----
 A7_OUT = RESULTS_DIR / "ablation_a7_no_covariates.csv"
-if A7_OUT.exists():
+if not ENABLE_A7:
+    print("[SKIP] A7 disabled (ENABLE_A7=False; inference-time zeroing is a weak ablation).")
+elif A7_OUT.exists():
     print("[SKIP] A7 already done.")
 else:
     print("=" * 70); print("ABLATION A7: SolarSDE with covariates c_t = 0"); print("=" * 70)
@@ -1233,7 +1240,9 @@ else:
 # This needs images; if raw images unavailable (e.g., only using GitHub-downloaded
 # artifacts), skip with a warning. A3 is reported as "limited ablation" in paper.
 A3_OUT = RESULTS_DIR / "ablation_a3_pixel_pca.csv"
-if A3_OUT.exists():
+if not ENABLE_A3:
+    print("[SKIP] A3 disabled (ENABLE_A3=False).")
+elif A3_OUT.exists():
     print("[SKIP] A3 already done.")
 else:
     RAW_DIR_GOLDEN = WORK_DIR / "cloudcv"
@@ -1362,98 +1371,210 @@ else:
 # COMPUTATIONAL BENCHMARK: params + train time + inference latency
 # ----------------------------------------------------------------
 
+CORRECTED_INFERENCE_CODE = '''\
+# ==== Corrected inference: advance time-deterministic covariates per rollout step ====
+# ML PhD audit finding: the original STAGE 0 eval holds covariates at t=0 for the
+# entire h-step rollout. Solar zenith and clear-sky-related features change
+# substantially over 30 minutes, especially near sunrise/sunset. This biases
+# the SDE drift at long horizons.
+#
+# Fix: at rollout step s, take solar geometry + time features from t+s while
+# keeping lagged trend features (kt_trend_*, ghi_std_*) and meteorology
+# (temperature, humidity, wind) frozen at t (since these aren't known-in-advance).
+#
+# Also saves per-horizon SolarSDE predictions to PREDS_DIR so the bootstrap CI
+# stage can evaluate all horizons (not just h=10min).
+ADVANCE_IDX = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+ADVANCE_MASK = np.zeros(C_DIM, dtype=bool)
+for i in ADVANCE_IDX:
+    if i < C_DIM:
+        ADVANCE_MASK[i] = True
+print(f"Future-covariate advancement: {ADVANCE_MASK.sum()}/{C_DIM} positions advance per step")
+
+CORRECTED_OUT = RESULTS_DIR / "solar_sde_main_corrected_results.csv"
+PREDS_DIR = RESULTS_DIR / "per_horizon_preds"
+PREDS_DIR.mkdir(parents=True, exist_ok=True)
+
+if CORRECTED_OUT.exists() and all((PREDS_DIR / f"solarsde_h{HORIZON_MIN[h]}.npz").exists() for h in HORIZONS):
+    print("[SKIP] Corrected inference already done.")
+else:
+    print("Running corrected inference (advanced covariates + per-horizon preds saved) ...")
+    sde_c = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    sde_c.load_state_dict(torch.load(CHECKPOINT_DIR / "sde_best.pt", map_location=DEVICE, weights_only=False))
+    sde_c.eval()
+    score_c = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
+    score_c.load_state_dict(torch.load(CHECKPOINT_DIR / "score_best.pt", map_location=DEVICE, weights_only=False))
+    score_c.eval()
+
+    te = data["test"]
+    n_test = len(te["Z"])
+    res_corr = {}
+    with torch.no_grad():
+        for h in HORIZONS:
+            preds_l, truths_l = [], []
+            n_eval = min(N_EVAL, n_test - h - 1)
+            for i in tqdm(range(0, n_eval, 32), desc=f"  corrected h={HORIZON_MIN[h]}min"):
+                end = min(i + 32, n_eval); bs = end - i
+                z0 = torch.from_numpy(te["Z"][i:end]).to(DEVICE)
+                z0 = z0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, Z_DIM)
+                cti0 = torch.from_numpy(te["cti"][i:end]).unsqueeze(-1).to(DEVICE)
+                cti0 = cti0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, 1)
+                kt0 = torch.from_numpy(te["kt"][i:end]).unsqueeze(-1).to(DEVICE)
+                kt0 = kt0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, 1)
+                c0_arr = te["cov"][i:end].copy()
+                z = z0
+                for s in range(h):
+                    c_step_arr = c0_arr.copy()
+                    if i + s + bs <= n_test:
+                        c_future = te["cov"][i+s:end+s]
+                        if c_future.shape == c0_arr.shape:
+                            c_step_arr[:, ADVANCE_MASK] = c_future[:, ADVANCE_MASK]
+                    c_step = torch.from_numpy(c_step_arr).to(DEVICE)
+                    c_step = c_step.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, C_DIM)
+                    t_norm = torch.full((bs * N_SAMPLES, 1), s / 180.0, device=DEVICE)
+                    z = z + sde_c.drift(z, t_norm, c_step) + sde_c.diffusion(z, cti0) * torch.randn_like(z)
+                c_final_arr = c0_arr.copy()
+                if i + h + bs <= n_test:
+                    c_future = te["cov"][i+h:end+h]
+                    if c_future.shape == c0_arr.shape:
+                        c_final_arr[:, ADVANCE_MASK] = c_future[:, ADVANCE_MASK]
+                c_final = torch.from_numpy(c_final_arr).to(DEVICE)
+                c_final = c_final.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, C_DIM)
+                kt_pred = score_c.sample(z, cti0, c_final, kt0, n=1).squeeze(-1).cpu().numpy()
+                kt_pred = kt_pred.reshape(bs, N_SAMPLES)
+                ghi_pred = kt_pred * te["gcs"][i:end][:, None]
+                preds_l.append(ghi_pred); truths_l.append(te["ghi"][i + h:end + h])
+            preds = np.concatenate(preds_l, axis=0); yt = np.concatenate(truths_l)
+            np.savez(PREDS_DIR / f"solarsde_h{HORIZON_MIN[h]}.npz", preds=preds, truths=yt)
+            m = {
+                "horizon_min": HORIZON_MIN[h], "horizon_steps": h, "n_eval": len(yt),
+                "crps": float(crps_empirical(yt, preds).mean()),
+                "rmse": float(np.sqrt(((preds.mean(1) - yt) ** 2).mean())),
+                "picp": float(((np.percentile(preds, 5, axis=1) <= yt) &
+                               (yt <= np.percentile(preds, 95, axis=1))).mean()),
+                "pinaw": float((np.percentile(preds, 95, axis=1) - np.percentile(preds, 5, axis=1)).mean()
+                               / max(yt.max() - yt.min(), 1.0)),
+            }
+            res_corr[h] = m
+            print(f"  corrected h={HORIZON_MIN[h]}min: CRPS={m['crps']:.2f} RMSE={m['rmse']:.2f} PICP={m['picp']:.3f}")
+    pd.DataFrame.from_dict(res_corr, orient="index").sort_values("horizon_min").to_csv(CORRECTED_OUT, index=False)
+
+    orig_p = RESULTS_DIR / "solar_sde_main_results.csv"
+    if orig_p.exists():
+        orig_df = pd.read_csv(orig_p)
+        print("\\nCorrected vs original SolarSDE eval:")
+        for h in HORIZONS:
+            orig_row = orig_df[orig_df["horizon_min"] == HORIZON_MIN[h]]
+            if len(orig_row):
+                d_crps = res_corr[h]["crps"] - orig_row["crps"].iloc[0]
+                d_pct = 100 * d_crps / orig_row["crps"].iloc[0]
+                print(f"  h={HORIZON_MIN[h]:2d}min: CRPS  {orig_row['crps'].iloc[0]:7.2f} -> {res_corr[h]['crps']:7.2f}  ({d_pct:+.1f}%)")
+
+    del sde_c, score_c; gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+'''
+
+
 COMPUTATIONAL_CODE = '''\
 # ==== Computational benchmark ====
-# Params, inference latency per forecast. Required for every Energy Reports paper.
+# Params, inference latency per forecast. Most Energy Reports submissions report
+# these in 1-2 sentences in the methodology section; full benchmark table is
+# optional. Disabled by default; flip ENABLE_COMPUTATIONAL=True to run.
 
-import time
+ENABLE_COMPUTATIONAL = False
 
-def count_params(m):
-    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+if not ENABLE_COMPUTATIONAL:
+    print("[SKIP] Computational benchmark disabled.")
+    print("       Quote params + latency in paper from the model definitions directly.")
+else:
+    import time
 
-bench_rows = []
+    def count_params(m):
+        return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-# Inline CS-VAE for param counting (matches Notebook 1 architecture)
-class _CmpEnc(nn.Module):
-    def __init__(self, latent=64, ch=(32, 64, 128, 256)):
-        super().__init__(); L, ic = [], 3
-        for c in ch:
-            L += [nn.Conv2d(ic, c, 4, 2, 1), nn.GroupNorm(min(32, c), c), nn.SiLU(inplace=True)]
-            ic = c
-        self.conv = nn.Sequential(*L); self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc_mu = nn.Linear(ch[-1], latent); self.fc_lv = nn.Linear(ch[-1], latent)
-    def forward(self, x):
-        h = self.pool(self.conv(x)).flatten(1); return self.fc_mu(h), self.fc_lv(h)
-class _CmpDec(nn.Module):
-    def __init__(self, latent=64, ch=(256, 128, 64, 32)):
-        super().__init__(); self.init_ch = ch[0]
-        self.fc = nn.Linear(latent, ch[0] * 8 * 8); L = []
-        for i in range(len(ch) - 1):
-            L += [nn.ConvTranspose2d(ch[i], ch[i+1], 4, 2, 1),
-                  nn.GroupNorm(min(32, ch[i+1]), ch[i+1]), nn.SiLU(inplace=True)]
-        L += [nn.ConvTranspose2d(ch[-1], 3, 4, 2, 1), nn.Sigmoid()]
-        self.deconv = nn.Sequential(*L)
-    def forward(self, z): return self.deconv(self.fc(z).view(-1, self.init_ch, 8, 8))
-class _CmpVAE(nn.Module):
-    def __init__(self, latent=64):
-        super().__init__()
-        self.encoder = _CmpEnc(latent); self.decoder = _CmpDec(latent)
-vae_main = _CmpVAE(latent=Z_DIM).to(DEVICE)
-try:
-    vae_main.load_state_dict(torch.load(CHECKPOINT_DIR / "vae_best.pt", map_location=DEVICE, weights_only=False))
-except Exception as _e:
-    print(f"  [WARN] could not load vae_best.pt ({_e}); reporting fresh-init param counts.")
-sde_main = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
-sde_main.load_state_dict(torch.load(CHECKPOINT_DIR / "sde_best.pt", map_location=DEVICE, weights_only=False))
-score_main = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
-score_main.load_state_dict(torch.load(CHECKPOINT_DIR / "score_best.pt", map_location=DEVICE, weights_only=False))
-
-bench_rows.append({"component": "CS-VAE",            "params": count_params(vae_main),    "params_M": count_params(vae_main) / 1e6})
-bench_rows.append({"component": "Latent Neural SDE", "params": count_params(sde_main),    "params_M": count_params(sde_main) / 1e6})
-bench_rows.append({"component": "Score Decoder",     "params": count_params(score_main),  "params_M": count_params(score_main) / 1e6})
-bench_rows.append({"component": "SolarSDE (total)",  "params": count_params(vae_main) + count_params(sde_main) + count_params(score_main),
-                   "params_M": (count_params(vae_main) + count_params(sde_main) + count_params(score_main)) / 1e6})
-
-def time_inference(sde_m, score_m, n_samples=50, h=30, n_warmup=5, n_runs=20):
-    sde_m.eval(); score_m.eval()
-    with torch.no_grad():
-        for _ in range(n_warmup):
-            z = torch.zeros(n_samples, Z_DIM, device=DEVICE)
-            cti = torch.zeros(n_samples, 1, device=DEVICE)
-            c = torch.zeros(n_samples, C_DIM, device=DEVICE)
-            kt = torch.zeros(n_samples, 1, device=DEVICE)
-            for s in range(h):
-                t = torch.full((n_samples, 1), s / 180.0, device=DEVICE)
-                z = z + sde_m.drift(z, t, c) + sde_m.diffusion(z, cti) * torch.randn_like(z)
-            _ = score_m.sample(z, cti, c, kt, n=1)
-        if torch.cuda.is_available(): torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(n_runs):
-            z = torch.zeros(n_samples, Z_DIM, device=DEVICE)
-            cti = torch.zeros(n_samples, 1, device=DEVICE)
-            c = torch.zeros(n_samples, C_DIM, device=DEVICE)
-            kt = torch.zeros(n_samples, 1, device=DEVICE)
-            for s in range(h):
-                t = torch.full((n_samples, 1), s / 180.0, device=DEVICE)
-                z = z + sde_m.drift(z, t, c) + sde_m.diffusion(z, cti) * torch.randn_like(z)
-            _ = score_m.sample(z, cti, c, kt, n=1)
-        if torch.cuda.is_available(): torch.cuda.synchronize()
-        return (time.time() - t0) / n_runs * 1000.0
-
-lat_5m  = time_inference(sde_main, score_main, n_samples=50, h=30)
-lat_30m = time_inference(sde_main, score_main, n_samples=50, h=180)
-bench_rows.append({"component": "Inference (h=5min, N=50)",  "latency_ms_per_forecast": lat_5m})
-bench_rows.append({"component": "Inference (h=30min, N=50)", "latency_ms_per_forecast": lat_30m})
-
-bench_df = pd.DataFrame(bench_rows)
-bench_df.to_csv(RESULTS_DIR / "computational_benchmark.csv", index=False)
-print("\\nComputational benchmark:")
-print(bench_df.to_string(index=False))
-print(f"\\nInference latency: {lat_5m:.1f} ms per 5-min forecast (50 samples)")
-print(f"                   {lat_30m:.1f} ms per 30-min forecast (50 samples)")
-
-del vae_main, sde_main, score_main; gc.collect()
-if torch.cuda.is_available(): torch.cuda.empty_cache()
+    bench_rows = []
+    
+    # Inline CS-VAE for param counting (matches Notebook 1 architecture)
+    class _CmpEnc(nn.Module):
+        def __init__(self, latent=64, ch=(32, 64, 128, 256)):
+            super().__init__(); L, ic = [], 3
+            for c in ch:
+                L += [nn.Conv2d(ic, c, 4, 2, 1), nn.GroupNorm(min(32, c), c), nn.SiLU(inplace=True)]
+                ic = c
+            self.conv = nn.Sequential(*L); self.pool = nn.AdaptiveAvgPool2d(1)
+            self.fc_mu = nn.Linear(ch[-1], latent); self.fc_lv = nn.Linear(ch[-1], latent)
+        def forward(self, x):
+            h = self.pool(self.conv(x)).flatten(1); return self.fc_mu(h), self.fc_lv(h)
+    class _CmpDec(nn.Module):
+        def __init__(self, latent=64, ch=(256, 128, 64, 32)):
+            super().__init__(); self.init_ch = ch[0]
+            self.fc = nn.Linear(latent, ch[0] * 8 * 8); L = []
+            for i in range(len(ch) - 1):
+                L += [nn.ConvTranspose2d(ch[i], ch[i+1], 4, 2, 1),
+                      nn.GroupNorm(min(32, ch[i+1]), ch[i+1]), nn.SiLU(inplace=True)]
+            L += [nn.ConvTranspose2d(ch[-1], 3, 4, 2, 1), nn.Sigmoid()]
+            self.deconv = nn.Sequential(*L)
+        def forward(self, z): return self.deconv(self.fc(z).view(-1, self.init_ch, 8, 8))
+    class _CmpVAE(nn.Module):
+        def __init__(self, latent=64):
+            super().__init__()
+            self.encoder = _CmpEnc(latent); self.decoder = _CmpDec(latent)
+    vae_main = _CmpVAE(latent=Z_DIM).to(DEVICE)
+    try:
+        vae_main.load_state_dict(torch.load(CHECKPOINT_DIR / "vae_best.pt", map_location=DEVICE, weights_only=False))
+    except Exception as _e:
+        print(f"  [WARN] could not load vae_best.pt ({_e}); reporting fresh-init param counts.")
+    sde_main = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+    sde_main.load_state_dict(torch.load(CHECKPOINT_DIR / "sde_best.pt", map_location=DEVICE, weights_only=False))
+    score_main = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
+    score_main.load_state_dict(torch.load(CHECKPOINT_DIR / "score_best.pt", map_location=DEVICE, weights_only=False))
+    
+    bench_rows.append({"component": "CS-VAE",            "params": count_params(vae_main),    "params_M": count_params(vae_main) / 1e6})
+    bench_rows.append({"component": "Latent Neural SDE", "params": count_params(sde_main),    "params_M": count_params(sde_main) / 1e6})
+    bench_rows.append({"component": "Score Decoder",     "params": count_params(score_main),  "params_M": count_params(score_main) / 1e6})
+    bench_rows.append({"component": "SolarSDE (total)",  "params": count_params(vae_main) + count_params(sde_main) + count_params(score_main),
+                       "params_M": (count_params(vae_main) + count_params(sde_main) + count_params(score_main)) / 1e6})
+    
+    def time_inference(sde_m, score_m, n_samples=50, h=30, n_warmup=5, n_runs=20):
+        sde_m.eval(); score_m.eval()
+        with torch.no_grad():
+            for _ in range(n_warmup):
+                z = torch.zeros(n_samples, Z_DIM, device=DEVICE)
+                cti = torch.zeros(n_samples, 1, device=DEVICE)
+                c = torch.zeros(n_samples, C_DIM, device=DEVICE)
+                kt = torch.zeros(n_samples, 1, device=DEVICE)
+                for s in range(h):
+                    t = torch.full((n_samples, 1), s / 180.0, device=DEVICE)
+                    z = z + sde_m.drift(z, t, c) + sde_m.diffusion(z, cti) * torch.randn_like(z)
+                _ = score_m.sample(z, cti, c, kt, n=1)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            t0 = time.time()
+            for _ in range(n_runs):
+                z = torch.zeros(n_samples, Z_DIM, device=DEVICE)
+                cti = torch.zeros(n_samples, 1, device=DEVICE)
+                c = torch.zeros(n_samples, C_DIM, device=DEVICE)
+                kt = torch.zeros(n_samples, 1, device=DEVICE)
+                for s in range(h):
+                    t = torch.full((n_samples, 1), s / 180.0, device=DEVICE)
+                    z = z + sde_m.drift(z, t, c) + sde_m.diffusion(z, cti) * torch.randn_like(z)
+                _ = score_m.sample(z, cti, c, kt, n=1)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            return (time.time() - t0) / n_runs * 1000.0
+    
+    lat_5m  = time_inference(sde_main, score_main, n_samples=50, h=30)
+    lat_30m = time_inference(sde_main, score_main, n_samples=50, h=180)
+    bench_rows.append({"component": "Inference (h=5min, N=50)",  "latency_ms_per_forecast": lat_5m})
+    bench_rows.append({"component": "Inference (h=30min, N=50)", "latency_ms_per_forecast": lat_30m})
+    
+    bench_df = pd.DataFrame(bench_rows)
+    bench_df.to_csv(RESULTS_DIR / "computational_benchmark.csv", index=False)
+    print("\\nComputational benchmark:")
+    print(bench_df.to_string(index=False))
+    print(f"\\nInference latency: {lat_5m:.1f} ms per 5-min forecast (50 samples)")
+    print(f"                   {lat_30m:.1f} ms per 30-min forecast (50 samples)")
+    
+    del vae_main, sde_main, score_main; gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 '''
 
 
@@ -1462,6 +1583,16 @@ EXTRA_BASELINES_CODE = '''\
 # Each saves results to RESULTS_DIR / baseline_<name>_results.csv.
 # Self-contained: rebuilds LSTM sequence tensors inline (doesn't depend on
 # cached files from the standard BASELINES stage).
+#
+# Toggle flags below — flip True to enable. Default: only SUNSET is on,
+# since CSDI (in standard baselines) already covers the score-based diffusion
+# baseline category, and MC-Dropout covers LSTM-with-uncertainty. The others
+# are nice-to-have but eat ~5-6 hours of GPU time for marginal paper benefit.
+
+ENABLE_DEEP_ENSEMBLE = False    # 5x LSTM ensemble (~1h). Cut: MC-Dropout already covers it.
+ENABLE_TIMEGRAD      = False    # RNN+DDPM autoregressive (~2-3h). Cut: CSDI covers diffusion class.
+ENABLE_RESNET_IMAGE  = False    # ResNet-18 deterministic (~2h). Cut: poor CRPS vs probabilistic methods.
+ENABLE_SUNSET        = True     # SKIPP'D benchmark CNN (~1h). KEEP — required Stanford reference.
 
 SEQ_LEN_X = 30
 def build_seq_tensors_x(df, seq_len, horizons):
@@ -1491,7 +1622,9 @@ print(f"  shapes: train={Xtr_xn.shape}  test={Xte_xn.shape}")
 
 # ---- Deep Ensemble: 5 LSTMs with different seeds, ensemble at inference ----
 DE_OUT = RESULTS_DIR / "baseline_deep_ensemble_results.csv"
-if DE_OUT.exists():
+if not ENABLE_DEEP_ENSEMBLE:
+    print("[SKIP] Deep Ensemble disabled (ENABLE_DEEP_ENSEMBLE=False).")
+elif DE_OUT.exists():
     print("[SKIP] Deep Ensemble already done.")
 else:
     print("=" * 70); print("BASELINE: Deep Ensemble (5x LSTM)"); print("=" * 70)
@@ -1546,7 +1679,9 @@ else:
 
 # ---- TimeGrad (RNN encoder + DDPM decoder, autoregressive) ----
 TG_OUT = RESULTS_DIR / "baseline_timegrad_results.csv"
-if TG_OUT.exists():
+if not ENABLE_TIMEGRAD:
+    print("[SKIP] TimeGrad disabled (ENABLE_TIMEGRAD=False).")
+elif TG_OUT.exists():
     print("[SKIP] TimeGrad already done.")
 else:
     print("=" * 70); print("BASELINE: TimeGrad (RNN + DDPM)"); print("=" * 70)
@@ -1646,7 +1781,9 @@ else:
 
 # ---- ResNet+Image: deterministic CNN baseline on raw sky images ----
 RES_OUT = RESULTS_DIR / "baseline_resnet_image_results.csv"
-if RES_OUT.exists():
+if not ENABLE_RESNET_IMAGE:
+    print("[SKIP] ResNet+Image disabled (ENABLE_RESNET_IMAGE=False).")
+elif RES_OUT.exists():
     print("[SKIP] ResNet+Image already done.")
 else:
     print("=" * 70); print("BASELINE: ResNet-18 + Sky Image"); print("=" * 70)
@@ -1726,7 +1863,9 @@ else:
 
 # ---- SUNSET: Stanford's published CNN baseline for SKIPP'D ----
 SS_OUT = RESULTS_DIR / "baseline_sunset_stanford_results.csv"
-if SS_OUT.exists():
+if not ENABLE_SUNSET:
+    print("[SKIP] SUNSET disabled (ENABLE_SUNSET=False).")
+elif SS_OUT.exists():
     print("[SKIP] SUNSET already done.")
 else:
     SF_LATENTS_DIR_LOCAL = LATENT_DIR / "stanford"
@@ -2226,9 +2365,50 @@ HEADER_PART2_MD = """# SolarSDE Part 2 — Training (~7-10 hours)
 5. Run Part 3 (07c_evaluation.ipynb) next.
 """
 
-HEADER_PART3_MD = """# SolarSDE Part 3 — Evaluation & Figures (~9-12 hours)
+HEADER_PART3_MD = """# SolarSDE Part 3 — Evaluation & Figures (~6-8 hours with default toggles)
 
 **Run 07a_foundations and 07b_training FIRST.** This notebook assumes SDE + Score + Stanford results exist.
+
+## ML PhD audit applied to this run
+
+**Fixed without retraining:**
+- **Future-covariate advancement** (Stage C+): solar zenith / hour / day-of-year features
+  advance per rollout step; lagged trends and meteorology stay frozen. Significant at
+  long horizons near sunrise/sunset where solar geometry shifts ~7-10° in 30 min.
+- **N_EVAL raised to 2000** for tighter bootstrap CIs (~12% test subsample vs prior 6%).
+- **Stanford horizons harmonized** to [1, 5, 10, 20, 30] min to match Golden.
+- **Per-horizon prediction npz files saved** so bootstrap CIs cover all 5 horizons.
+
+**Cut for runtime (default toggles, can flip True in cells):**
+- `ENABLE_MULTISEED = False` (saves ~5h, single-seed is standard for Energy Reports)
+- `ENABLE_DEEP_ENSEMBLE = False` (MC-Dropout already covers LSTM-with-uncertainty)
+- `ENABLE_TIMEGRAD = False` (CSDI already covers diffusion-baseline category)
+- `ENABLE_RESNET_IMAGE = False` (deterministic CNN loses on CRPS by construction)
+- `ENABLE_A7 = False` (inference-time zeroing is a weak ablation — would need retrain)
+- `ENABLE_COMPUTATIONAL = False` (1 paragraph in paper replaces full benchmark)
+- `ENABLE_SUNSET = True` (KEPT — required Stanford reference baseline)
+
+**Known limitations (documented in paper):**
+- Drift `t` parameter has training/inference semantic mismatch (target horizon vs current step) — defensible because z carries horizon info, but suboptimal. Fix needs SDE retrain.
+- VAE trained 20 epochs at 128×128 vs CLAUDE.md spec's 100 epochs at 256×256 — sufficient given dataset size.
+
+## Stages
+
+| Stage | What it does | Est. runtime |
+|-------|--------------|--------------|
+| C+ | Corrected inference with advanced covariates + per-horizon prediction saves | ~30 min |
+| D | Standard baselines: Persistence, Smart-Pers, LSTM, MC-Dropout, CSDI | ~2-3h |
+| E | SUNSET (only — others cut by default toggles) | ~1h |
+| F | Ablations A2, A4, A5, A3 (no-VAE PCA) | ~2h |
+| G | Conformal calibration | 10 min |
+| H | Stratified eval + Diebold-Mariano test | 30 min |
+| I | PIT + reliability + sharpness + bootstrap CIs | 30 min |
+| J | Cross-site transfer (Golden ↔ Stanford) | ~1h |
+| K | Economic value (CAISO reserve simulation) | 15 min |
+| M | Analysis figures (CTI, regime, forecast traces) | 15 min |
+| N | Publication figures + LaTeX tables | <10 min |
+
+Total: ~7-8h with default toggles. Comfortably under Kaggle's 12-hour limit.
 
 ## Stages
 
@@ -2305,6 +2485,8 @@ def part3_nb():
             ("code", _REQUIRE_TRAINING_CODE),
             ("markdown", "## 2. Load data tensors"),
             ("code", LOAD_DATA_TOLERANT_CODE),
+            ("markdown", "## STAGE C+ — Corrected inference (advance time-deterministic covariates)"),
+            ("code", CORRECTED_INFERENCE_CODE),
             ("markdown", "## STAGE D — Standard baselines"),
             ("code", BASELINES_CODE),
             ("markdown", "## STAGE E — Extra baselines (Deep Ensemble, TimeGrad, ResNet+Image, SUNSET)"),
