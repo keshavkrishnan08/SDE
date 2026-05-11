@@ -2576,51 +2576,274 @@ Total: ~7-8h with default toggles. Comfortably under Kaggle's 12-hour limit.
 """
 
 
-def part1_nb():
-    """07a — Foundations: Retrain Golden + Stanford pipeline."""
+AUTO_PUSH_CODE = '''\
+# ==== Auto-push results to GitHub ====
+# Requires a Kaggle Secret labeled GITHUB_PAT containing a Personal Access Token
+# with `repo` scope. To add: Kaggle right sidebar → Add-ons → Secrets → Add Label.
+#
+# What gets pushed: contents of PERSIST_DIR (checkpoints, latents, results,
+# figures, splits, extended) mirrored to colab_outputs/ on the repo. Files
+# larger than MAX_FILE_MB are skipped to keep the repo size reasonable.
+
+ENABLE_AUTO_PUSH = True
+GITHUB_REPO   = "keshavkrishnan08/SDE"
+GITHUB_BRANCH = "main"
+MAX_FILE_MB   = 50
+
+def _get_github_token():
+    try:
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret("GITHUB_PAT")
+    except Exception:
+        pass
+    return os.environ.get("GITHUB_PAT")
+
+print(f"\\n{'='*70}")
+print(f"AUTO-PUSH results for {NOTEBOOK_TAG}")
+print(f"{'='*70}")
+if not ENABLE_AUTO_PUSH:
+    print("[SKIP] Auto-push disabled (ENABLE_AUTO_PUSH=False).")
+else:
+    tok = _get_github_token()
+    if not tok:
+        print("[SKIP] No GITHUB_PAT secret found.")
+        print("To enable: Kaggle sidebar → Add-ons → Secrets → Add Label 'GITHUB_PAT'")
+        print("           Value: your GitHub Personal Access Token (with 'repo' scope)")
+        print("           Generate at: github.com/settings/tokens/new")
+    else:
+        import tempfile, shutil, subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp) / "repo"
+            url = f"https://{tok}@github.com/{GITHUB_REPO}.git"
+            print(f"  cloning {GITHUB_REPO} (depth=1, branch={GITHUB_BRANCH})...")
+            res = subprocess.run(
+                ["git", "clone", "--depth=1", "--branch", GITHUB_BRANCH, url, str(tmp_p)],
+                capture_output=True, text=True,
+            )
+            if res.returncode != 0:
+                print(f"[FAIL] git clone: {res.stderr[:400]}")
+            else:
+                target_root = tmp_p / "colab_outputs"
+                target_root.mkdir(parents=True, exist_ok=True)
+                copied, skipped_big = 0, 0
+                for sub in ["checkpoints", "results", "latents", "figures", "splits", "extended"]:
+                    src = PERSIST_DIR / sub
+                    if not src.exists():
+                        continue
+                    for f in src.rglob("*"):
+                        if not f.is_file():
+                            continue
+                        size_mb = f.stat().st_size / 1e6
+                        if size_mb > MAX_FILE_MB:
+                            print(f"  [skip >{MAX_FILE_MB}MB] {f.relative_to(PERSIST_DIR)} ({size_mb:.1f} MB)")
+                            skipped_big += 1
+                            continue
+                        rel = f.relative_to(PERSIST_DIR)
+                        dst = target_root / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, dst)
+                        copied += 1
+                print(f"  staged {copied} files, skipped {skipped_big} that exceed {MAX_FILE_MB} MB")
+                subprocess.run(["git", "-C", str(tmp_p), "config", "user.email",
+                                "kaggle-auto@bot.com"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(tmp_p), "config", "user.name",
+                                "Kaggle Auto-Push"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(tmp_p), "add", "-A", "colab_outputs"],
+                               capture_output=True)
+                diff_res = subprocess.run(["git", "-C", str(tmp_p), "diff", "--cached", "--quiet"])
+                if diff_res.returncode == 0:
+                    print("[SKIP] No changes vs current main — nothing to push.")
+                else:
+                    msg = f"Auto-push {NOTEBOOK_TAG} results from Kaggle"
+                    subprocess.run(["git", "-C", str(tmp_p), "commit", "-m", msg],
+                                   check=True, capture_output=True)
+                    push_res = subprocess.run(
+                        ["git", "-C", str(tmp_p), "push", "origin", GITHUB_BRANCH],
+                        capture_output=True, text=True,
+                    )
+                    if push_res.returncode == 0:
+                        print(f"  PUSHED to github.com/{GITHUB_REPO} successfully")
+                        print(f"  Next notebook's soft fast-start will pick these up automatically.")
+                    else:
+                        print(f"[FAIL] git push: {push_res.stderr[:400]}")
+'''
+
+
+# Per-notebook tag prefixes (passed via NOTEBOOK_TAG = "..." cell before AUTO_PUSH)
+def _tag_cell(tag):
+    return ("code", f'NOTEBOOK_TAG = "{tag}"')
+
+
+HEADER_07A1_MD = """# SolarSDE 07a1 — Golden Foundations (~3-4 hours)
+
+**Run this notebook FIRST.** Produces the Golden CO VAE + latents + physics features +
+extended splits. These artifacts are the foundation everything else builds on.
+
+## What this notebook does
+
+| Step | What | Time |
+|------|------|------|
+| Retrain (conditional) | Download CloudCV ~2.6 GB, BMS data, preprocess into splits, train Golden VAE 20 epochs, extract latents + CTI, save kt/ghi_clearsky/physics features, build 90-day extended splits | ~3-4h |
+| Zip + auto-push | Push results to colab_outputs/ on the GitHub repo | <5 min |
+
+**Skip behavior:** if the GitHub repo already has cached Golden artifacts, the soft
+fast-start pulls them and this entire stage skips in ~30 seconds.
+
+## Kaggle setup
+
+1. Enable P100 GPU + Internet (Settings panel)
+2. Add a Kaggle Secret named `GITHUB_PAT` with your GitHub Personal Access Token
+   (Settings → Secrets → Add Secret, value = your PAT with `repo` scope from
+   github.com/settings/tokens/new). Without this, auto-push silently skips and
+   you'll need to manually download outputs.
+3. Run all cells. Auto-push at the end syncs results to GitHub so 07a2 can use them.
+"""
+
+HEADER_07A2_MD = """# SolarSDE 07a2 — Stanford SKIPP'D Pipeline (~6-8 hours)
+
+**Run 07a1 FIRST.** This notebook needs the Golden artifacts pushed by 07a1.
+
+## What this notebook does
+
+| Step | What | Time |
+|------|------|------|
+| Stanford SKIPP'D | Download HDF5 ~4.4 GB, train Stanford VAE 30 epochs, extract latents + CTI, train Stanford SDE + Score Decoder 30 epochs each, evaluate at horizons [1,5,10,20,30] min | ~6-8h |
+| Zip + auto-push | Push Stanford artifacts to colab_outputs/ on the GitHub repo | <5 min |
+
+**Skip behavior:** if Stanford artifacts exist, all sub-stages skip individually.
+
+## Kaggle setup
+
+1. Same as 07a1 (P100 + Internet + GITHUB_PAT secret).
+2. Soft fast-start will pull Golden artifacts from main (pushed by 07a1).
+3. Run all cells.
+"""
+
+HEADER_07B_MD = """# SolarSDE 07b — Training (~4-5 hours)
+
+**Run 07a1 + 07a2 FIRST.** Image features + Golden SolarSDE training.
+
+## What this notebook does
+
+| Step | What | Time |
+|------|------|------|
+| Image features | Optical flow + sun-ROI + cloud fraction on Golden | ~30 min |
+| Train SolarSDE | Latent Neural SDE + Cond Score Decoder on Golden, seed 42 | ~3-4h |
+| Multi-seed (off by default) | Seeds 123, 456 — toggle ENABLE_MULTISEED=True in Stage C2 cell | +4-6h if on |
+| Zip + auto-push | Sync to GitHub | <5 min |
+
+Single-seed run is standard for Energy Reports submissions.
+"""
+
+HEADER_07C_MD = """# SolarSDE 07c — Evaluation & Figures (~6-8 hours)
+
+**Run 07a1 + 07a2 + 07b FIRST.** All baselines + ablations + stats + figures.
+
+## ML PhD audit applied to this run
+
+**Fixed without retraining:**
+- Future-covariate advancement (Stage C+): solar zenith/hour/DOY advance per
+  rollout step; lagged trends and meteorology stay frozen
+- N_EVAL raised to 2000 for tighter bootstrap CIs
+- Stanford horizons harmonized to [1, 5, 10, 20, 30] min
+- Per-horizon prediction npz files saved for full bootstrap coverage
+
+**Cut for runtime (toggleable in cells, default False):**
+- ENABLE_MULTISEED, ENABLE_DEEP_ENSEMBLE, ENABLE_TIMEGRAD, ENABLE_RESNET_IMAGE,
+  ENABLE_A7, ENABLE_COMPUTATIONAL — all default False
+- ENABLE_SUNSET, ENABLE_A3 — default True (required Stanford reference + meaningful ablation)
+
+## Stages
+
+| Stage | What | Time |
+|-------|------|------|
+| C+ | Corrected inference + per-horizon prediction saves | ~30 min |
+| D  | Persistence, Smart-Pers, LSTM, MC-Dropout, CSDI | ~2-3h |
+| E  | SUNSET only (others toggled off) | ~1h |
+| F  | Ablations A2, A4, A5, A3 (no-VAE PCA) | ~2h |
+| G  | Conformal calibration | 10 min |
+| H  | Stratified eval + Diebold-Mariano | 30 min |
+| I  | PIT + reliability + sharpness + bootstrap CIs | 30 min |
+| J  | Cross-site transfer (Golden ↔ Stanford) | ~1h |
+| K  | Economic value (CAISO reserve simulation) | 15 min |
+| M  | Analysis figures (CTI, regime, forecast traces) | 15 min |
+| N  | Publication figures + LaTeX tables | <10 min |
+
+Final auto-push uploads tables + figures + zip to GitHub.
+"""
+
+
+def nb_07a1():
+    """Golden foundations: retrain VAE + extract latents + physics features."""
     cells = (
-        [("markdown", HEADER_PART1_MD)]
+        [("markdown", HEADER_07A1_MD)]
         + _COMMON_PREFIX
         + _RETRAIN_BLOCK
         + [
-            ("markdown", "## 2. Load data tensors"),
+            ("markdown", "## 2. Load data tensors (verifies retrain produced everything)"),
             ("code", LOAD_DATA_TOLERANT_CODE),
-            ("markdown", "## STAGE A — Stanford SKIPP'D as full second site"),
-            ("code", STANFORD_FULL_PIPELINE_CODE),
-            ("markdown", "## Final: zip Part 1 outputs"),
+            ("markdown", "## Final: zip outputs"),
             ("code", ZIP_DOWNLOAD_CODE),
+            ("markdown", "## Auto-push results to GitHub"),
+            _tag_cell("07a1_golden_foundations"),
+            ("code", AUTO_PUSH_CODE),
         ]
     )
     return build_nb(cells)
 
 
-def part2_nb():
-    """07b — Training: Image features + Golden SolarSDE training + multi-seed."""
+def nb_07a2():
+    """Stanford SKIPP'D as a full second site."""
     cells = (
-        [("markdown", HEADER_PART2_MD)]
+        [("markdown", HEADER_07A2_MD)]
         + _COMMON_PREFIX
         + [
             ("markdown", "## Prerequisite check"),
             ("code", _REQUIRE_FOUNDATIONS_CODE),
             ("markdown", "## 2. Load data tensors"),
             ("code", LOAD_DATA_TOLERANT_CODE),
-            ("markdown", "## STAGE B — Image features (Golden: optical flow + sun-ROI + cloud)"),
-            ("code", STAGE_MINUS1_CODE),
-            ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
-            ("code", STAGE0_CODE),
-            ("markdown", "## STAGE C2 — Multi-seed runs (seeds 123, 456) for variance estimation"),
-            ("code", MULTISEED_CODE),
-            ("markdown", "## Final: zip Part 2 outputs"),
+            ("markdown", "## STAGE A — Stanford SKIPP'D as full second site"),
+            ("code", STANFORD_FULL_PIPELINE_CODE),
+            ("markdown", "## Final: zip outputs"),
             ("code", ZIP_DOWNLOAD_CODE),
+            ("markdown", "## Auto-push results to GitHub"),
+            _tag_cell("07a2_stanford_pipeline"),
+            ("code", AUTO_PUSH_CODE),
         ]
     )
     return build_nb(cells)
 
 
-def part3_nb():
-    """07c — Evaluation: all baselines + ablations + stats + figures + tables."""
+def nb_07b():
+    """Image features + Golden SolarSDE training + multi-seed (optional)."""
     cells = (
-        [("markdown", HEADER_PART3_MD)]
+        [("markdown", HEADER_07B_MD)]
+        + _COMMON_PREFIX
+        + [
+            ("markdown", "## Prerequisite check"),
+            ("code", _REQUIRE_FOUNDATIONS_CODE),
+            ("markdown", "## 2. Load data tensors"),
+            ("code", LOAD_DATA_TOLERANT_CODE),
+            ("markdown", "## STAGE B — Image features (optical flow + sun-ROI + cloud)"),
+            ("code", STAGE_MINUS1_CODE),
+            ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
+            ("code", STAGE0_CODE),
+            ("markdown", "## STAGE C2 — Multi-seed runs (off by default; flip ENABLE_MULTISEED=True to enable)"),
+            ("code", MULTISEED_CODE),
+            ("markdown", "## Final: zip outputs"),
+            ("code", ZIP_DOWNLOAD_CODE),
+            ("markdown", "## Auto-push results to GitHub"),
+            _tag_cell("07b_training"),
+            ("code", AUTO_PUSH_CODE),
+        ]
+    )
+    return build_nb(cells)
+
+
+def nb_07c():
+    """All baselines + ablations + stats + figures + tables."""
+    cells = (
+        [("markdown", HEADER_07C_MD)]
         + _COMMON_PREFIX
         + [
             ("markdown", "## Prerequisite check"),
@@ -2632,31 +2855,33 @@ def part3_nb():
             ("code", CORRECTED_INFERENCE_CODE),
             ("markdown", "## STAGE D — Standard baselines"),
             ("code", BASELINES_CODE),
-            ("markdown", "## STAGE E — Extra baselines (Deep Ensemble, TimeGrad, ResNet+Image, SUNSET)"),
+            ("markdown", "## STAGE E — Extra baselines (SUNSET on by default, others off)"),
             ("code", EXTRA_BASELINES_CODE),
             ("markdown", "## STAGE F — Ablations"),
             ("code", ABLATIONS_CODE),
             ("code", EXTRA_ABLATIONS_CODE),
             ("markdown", "## STAGE G — Conformal calibration"),
             ("code", CALIBRATION_CODE),
-            ("markdown", "## STAGE H — Stratified evaluation + Diebold-Mariano test"),
+            ("markdown", "## STAGE H — Stratified eval + DM test"),
             ("code", STRATIFIED_CODE),
             ("markdown", "## STAGE I — PIT + reliability + sharpness + bootstrap CIs"),
             ("code", PIT_RELIABILITY_CODE),
             ("code", BOOTSTRAP_CIS_CODE),
-            ("markdown", "## STAGE J — Cross-site transfer (Golden ↔ Stanford)"),
+            ("markdown", "## STAGE J — Cross-site transfer"),
             ("code", CROSSSITE_CODE),
-            ("markdown", "## STAGE K — Economic value (CAISO reserve simulation)"),
+            ("markdown", "## STAGE K — Economic value (CAISO)"),
             ("code", ECONOMIC_CAISO_CODE),
-            ("markdown", "## STAGE L — Computational benchmark"),
+            ("markdown", "## STAGE L — Computational benchmark (off by default)"),
             ("code", COMPUTATIONAL_CODE),
-            ("markdown", "## STAGE M — Analysis figures (CTI, regime, forecast traces)"),
+            ("markdown", "## STAGE M — Analysis figures"),
             ("code", ANALYSIS_CODE),
             ("markdown", "## STAGE N — Publication figures + LaTeX tables"),
             ("code", PUB_FIGURES_CODE),
             ("code", LATEX_TABLES_CODE),
-            ("markdown", "## Final: zip & download full paper package"),
+            ("markdown", "## Final: zip + auto-push the paper package"),
             ("code", ZIP_DOWNLOAD_CODE),
+            _tag_cell("07c_evaluation"),
+            ("code", AUTO_PUSH_CODE),
         ]
     )
     return build_nb(cells)
@@ -2664,9 +2889,10 @@ def part3_nb():
 
 if __name__ == "__main__":
     for name, builder in [
-        ("07a_foundations.ipynb", part1_nb),
-        ("07b_training.ipynb",    part2_nb),
-        ("07c_evaluation.ipynb",  part3_nb),
+        ("07a1_golden_foundations.ipynb", nb_07a1),
+        ("07a2_stanford_pipeline.ipynb",  nb_07a2),
+        ("07b_training.ipynb",            nb_07b),
+        ("07c_evaluation.ipynb",          nb_07c),
     ]:
         path = NB_DIR / name
         nb = builder()
