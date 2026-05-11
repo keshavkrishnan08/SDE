@@ -38,11 +38,129 @@ from _combined_generator import (
     CALIBRATION_CODE, STRATIFIED_CODE, ANALYSIS_CODE,
     ZIP_DOWNLOAD_CODE,
 )
-# Pull Notebook 1's data download + VAE training blocks for the from-scratch path
+# Pull Notebook 1's data download + VAE training blocks for the from-scratch path.
+# CLOUDCV_DOWNLOAD and CLOUDCV_EXTRACT are replaced with robust versions below
+# that add retry logic + size validation + tar corruption recovery.
 from _generator import (
-    CLOUDCV_DOWNLOAD, CLOUDCV_EXTRACT, BMS_DOWNLOAD, PREPROCESS_CODE,
+    BMS_DOWNLOAD, PREPROCESS_CODE,
     VAE_MODEL, IMAGE_DATASET, VAE_TRAIN, LATENT_EXTRACT,
 )
+
+
+# ================================================================
+# Robust download blocks (replace the brittle versions in _generator.py)
+# ================================================================
+
+CLOUDCV_DOWNLOAD_ROBUST = '''\
+# ==== Download CloudCV dataset (with retry + size validation + S3 redirect handling) ====
+# NREL's data.nrel.gov endpoint redirects to data.nlr.gov which redirects to an
+# AWS S3 pre-signed URL valid for 5 minutes. If a download is interrupted, the
+# pre-signed URL may have expired by retry time, so each retry re-issues the
+# original request (which gets a fresh pre-signed URL).
+import requests, time
+from tqdm import tqdm
+
+CLOUDCV_DIR = DATA_DIR / "cloudcv"
+CLOUDCV_DIR.mkdir(parents=True, exist_ok=True)
+
+CLOUDCV_FILES = {
+    "2019_09_07.tar.gz": "https://data.nrel.gov/system/files/248/1727737056-2019_09_07.tar.gz",
+    "2019_09_08.tar.gz": "https://data.nrel.gov/system/files/248/1727737056-2019_09_08.tar.gz",
+    "2019_09_14.tar.gz": "https://data.nrel.gov/system/files/248/1727737056-2019_09_14.tar.gz",
+    "2019_09_15.tar.gz": "https://data.nrel.gov/system/files/248/1727737056-2019_09_15.tar.gz",
+    "2019_09_21.tar.gz": "https://data.nrel.gov/system/files/248/1727737586-2019_09_21.tar.gz",
+    "2019_09_22.tar.gz": "https://data.nrel.gov/system/files/248/1727737586-2019_09_22.tar.gz",
+    "2019_09_28.tar.gz": "https://data.nrel.gov/system/files/248/1727737586-2019_09_28.tar.gz",
+    "2019_09_29.tar.gz": "https://data.nrel.gov/system/files/248/1727737586-2019_09_29.tar.gz",
+}
+MIN_TAR_SIZE_BYTES = 100 * 1024 * 1024   # CloudCV daily tars are 300-400 MB; reject anything <100 MB as corrupt
+
+def download_with_retry(url, dest, min_size=MIN_TAR_SIZE_BYTES, max_retries=4):
+    """Download with retry + size validation. Re-issues request each attempt
+    so AWS pre-signed URLs are refreshed. Returns True if final file passes size check."""
+    if dest.exists() and dest.stat().st_size >= min_size:
+        print(f"  Already have: {dest.name} ({dest.stat().st_size / 1e6:.1f} MB)")
+        return True
+    if dest.exists() and dest.stat().st_size < min_size:
+        print(f"  Partial/corrupt file {dest.name} ({dest.stat().st_size / 1e6:.2f} MB) — removing.")
+        dest.unlink()
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"  [attempt {attempt}/{max_retries}] {dest.name}")
+            with requests.get(url, stream=True, timeout=600, allow_redirects=True) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                with open(dest, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc=dest.name) as pb:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk); pb.update(len(chunk))
+            if dest.stat().st_size < min_size:
+                raise RuntimeError(f"downloaded size {dest.stat().st_size / 1e6:.2f} MB < min {min_size / 1e6:.0f} MB")
+            return True
+        except Exception as e:
+            last_err = e
+            print(f"    FAILED: {e}")
+            if dest.exists():
+                dest.unlink()
+            if attempt < max_retries:
+                wait = 5 * attempt   # 5s, 10s, 15s exponential-ish backoff
+                print(f"    waiting {wait}s before retry ...")
+                time.sleep(wait)
+    print(f"  GAVE UP on {dest.name} after {max_retries} attempts. Last error: {last_err}")
+    return False
+
+print("=" * 70)
+print("Downloading CloudCV dataset (8 days, ~2.6 GB)")
+print("=" * 70)
+failed = []
+for name, url in CLOUDCV_FILES.items():
+    if not download_with_retry(url, CLOUDCV_DIR / name):
+        failed.append(name)
+if failed:
+    raise RuntimeError(f"CloudCV download incomplete: {failed}. Re-run this cell or check network.")
+print("CloudCV download complete (all 8 files verified > 100 MB).")
+'''
+
+
+CLOUDCV_EXTRACT_ROBUST = '''\
+# ==== Extract CloudCV archives (with corruption detection + retry) ====
+import tarfile
+
+print("Extracting tar.gz archives ...")
+corrupt = []
+for tgz in sorted(CLOUDCV_DIR.glob("2019_*.tar.gz")):
+    stem = tgz.stem.replace(".tar", "")
+    out = CLOUDCV_DIR / stem
+    if out.exists() and any(out.rglob("*.jpg")):
+        n = sum(1 for _ in (out / "images").glob("*.jpg")) if (out / "images").exists() else 0
+        if n > 0:
+            print(f"  {stem}: already extracted ({n} images)")
+            continue
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(tgz, "r:gz") as tf:
+            tf.extractall(out)
+        n_imgs = sum(1 for _ in (out / "images").glob("*.jpg")) if (out / "images").exists() else 0
+        if n_imgs < 100:
+            raise RuntimeError(f"only {n_imgs} images extracted (expected ~500-1000)")
+        print(f"  {stem}: extracted ({n_imgs} images)")
+    except Exception as e:
+        print(f"  {stem}: EXTRACT FAILED ({e}) — marking tar for re-download")
+        corrupt.append(tgz.name)
+        if tgz.exists():
+            tgz.unlink()
+
+if corrupt:
+    raise RuntimeError(f"Corrupt tarballs deleted: {corrupt}. Re-run CLOUDCV_DOWNLOAD cell.")
+
+# Free disk by removing tarballs after successful extraction
+for tgz in CLOUDCV_DIR.glob("*.tar.gz"):
+    try: tgz.unlink()
+    except Exception: pass
+print("Extraction complete. tar.gz archives removed to free disk.")
+'''
 
 
 # ================================================================
@@ -506,23 +624,48 @@ else:
     pip_install("h5py")
     import h5py
 
-    # ---- A.1 Download SKIPP'D HDF5 (~3-4 GB) ----
-    if not SF_HDF5.exists() or SF_HDF5.stat().st_size < 1_000_000_000:
-        print("[A.1] Downloading SKIPP'D HDF5 (~3-4 GB) ...")
-        import requests
-        url = "https://stacks.stanford.edu/file/dj417rh1007/2017_2019_images_pv_processed.hdf5"
-        with requests.get(url, stream=True, timeout=3600) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with open(SF_HDF5, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc="HDF5") as pb:
-                for chunk in r.iter_content(chunk_size=65536):
-                    f.write(chunk); pb.update(len(chunk))
-        # Times metadata
-        for nm in ("times_trainval.npy", "times_test.npy"):
-            r = requests.get(f"https://stacks.stanford.edu/file/dj417rh1007/{nm}", timeout=600)
-            (SF_DIR / nm).write_bytes(r.content)
-    else:
-        print("[A.1] SKIPP'D HDF5 already present.")
+    # ---- A.1 Download SKIPP'D HDF5 (~3-4 GB) with retry + size validation ----
+    SF_HDF5_MIN_SIZE = 3_000_000_000   # actual file ~4.4 GB; reject anything <3 GB
+    import requests, time as _time
+
+    def _sf_download(url, dest, min_size, max_retries=4, chunk=1024 * 1024):
+        if dest.exists() and dest.stat().st_size >= min_size:
+            print(f"  Already have: {dest.name} ({dest.stat().st_size / 1e9:.2f} GB)")
+            return True
+        if dest.exists() and dest.stat().st_size < min_size:
+            print(f"  Partial/corrupt {dest.name} ({dest.stat().st_size / 1e6:.2f} MB) — removing.")
+            dest.unlink()
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"  [attempt {attempt}/{max_retries}] {dest.name}")
+                with requests.get(url, stream=True, timeout=3600) as r:
+                    r.raise_for_status()
+                    total = int(r.headers.get("content-length", 0))
+                    with open(dest, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc=dest.name) as pb:
+                        for c in r.iter_content(chunk_size=chunk):
+                            if c:
+                                f.write(c); pb.update(len(c))
+                if dest.stat().st_size < min_size:
+                    raise RuntimeError(f"got {dest.stat().st_size / 1e6:.2f} MB < min {min_size / 1e6:.0f} MB")
+                return True
+            except Exception as e:
+                last_err = e
+                print(f"    FAILED: {e}")
+                if dest.exists(): dest.unlink()
+                if attempt < max_retries:
+                    _time.sleep(5 * attempt)
+        raise RuntimeError(f"Stanford download {dest.name} failed after {max_retries} attempts: {last_err}")
+
+    print("[A.1] Downloading SKIPP'D HDF5 (~4.4 GB) ...")
+    _sf_download("https://stacks.stanford.edu/file/dj417rh1007/2017_2019_images_pv_processed.hdf5",
+                 SF_HDF5, SF_HDF5_MIN_SIZE)
+    # Times metadata (small files, simpler retry)
+    for nm, min_b in [("times_trainval.npy", 1_000_000), ("times_test.npy", 100_000)]:
+        dst = SF_DIR / nm
+        if dst.exists() and dst.stat().st_size >= min_b:
+            continue
+        _sf_download(f"https://stacks.stanford.edu/file/dj417rh1007/{nm}", dst, min_b, max_retries=3)
 
     # ---- A.2 Load splits + persist as npy ----
     print("[A.2] Loading SKIPP'D HDF5 ...")
@@ -2269,8 +2412,8 @@ _RETRAIN_BLOCK = [
     ("code", GOLDEN_RETRAIN_GUARD_CODE),
     ("code", "LATENT_DIM = 64\nIMG_SIZE = 128\n" + VAE_MODEL),
     ("code", _gate("ENABLE_GOLDEN_RETRAIN and not all((DATA_DIR / 'cloudcv' / f).exists() "
-                   "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD)),
-    ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT)),
+                   "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD_ROBUST)),
+    ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT_ROBUST)),
     ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (DATA_DIR / 'bms' / 'bms_srrl_2019.csv').exists()",
                    BMS_DOWNLOAD)),
     ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (SPLITS_DIR / 'train.parquet').exists()",
