@@ -915,7 +915,8 @@ else:
                 kt_c = b["kt_current"].unsqueeze(-1).to(DEVICE)
                 z = b["z_t"].to(DEVICE); cti = b["cti_t"].unsqueeze(-1).to(DEVICE)
                 c = b["c_t"].to(DEVICE)
-                loss = sf_score.training_loss(kt_t, kt_c, z, cti, c)
+                loss_d = sf_score.training_loss(kt_t, kt_c, z, cti, c)
+                loss = loss_d["loss"] if isinstance(loss_d, dict) else loss_d
                 opt_score.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(sf_score.parameters(), 1.0); opt_score.step()
                 tl += loss.item(); n += 1
@@ -1068,11 +1069,12 @@ def _train_and_eval_seed(seed):
     for ep in range(1, 31):
         score_s.train(); n = 0; tl = 0
         for b in sdl:
-            loss = score_s.training_loss(
+            loss_d = score_s.training_loss(
                 b["kt_target"].unsqueeze(-1).to(DEVICE),
                 b["kt_current"].unsqueeze(-1).to(DEVICE),
                 b["z_t"].to(DEVICE), b["cti_t"].unsqueeze(-1).to(DEVICE),
                 b["c_t"].to(DEVICE))
+            loss = loss_d["loss"] if isinstance(loss_d, dict) else loss_d
             opt2.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(score_s.parameters(), 1.0); opt2.step()
             tl += loss.item(); n += 1
