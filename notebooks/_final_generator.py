@@ -862,29 +862,33 @@ else:
         ds = SfMHDS(sf_z_tr, sf_cti_tr, sf_cov_tr)
         dl = DataLoader(ds, batch_size=512, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 
-        print(f"  SDE: training on {len(ds)} mixed-horizon transitions")
-        for ep in range(1, 31):
-            sf_sde.train(); tl_d = tl_s = 0; n = 0
-            for b in dl:
-                z = b["z_t"].to(DEVICE); zn = b["z_next"].to(DEVICE)
-                k = b["k"].float().unsqueeze(-1).to(DEVICE)
-                t = (k / 30.0)
-                cti = b["cti_t"].unsqueeze(-1).to(DEVICE)
-                c = b["c_t"].to(DEVICE)
-                mu = sf_sde.drift(z, t, c)
-                sigma = sf_sde.diffusion(z, cti)
-                dz = (zn - z) / k
-                drift_loss = F.mse_loss(mu, dz)
-                resid = zn - z - mu * k
-                target_var = (resid ** 2) / k.clamp(min=1.0)
-                sigma_sq = sigma.pow(2).clamp(min=1e-6)
-                diff_loss = F.mse_loss(torch.log(sigma_sq + 1e-8), torch.log(target_var + 1e-8))
-                loss = drift_loss + 0.5 * diff_loss
-                opt_sde.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(sf_sde.parameters(), 1.0); opt_sde.step()
-                tl_d += drift_loss.item(); tl_s += diff_loss.item(); n += 1
-            print(f"  SDE ep {ep}/30: drift={tl_d/n:.4f} diff={tl_s/n:.4f}")
-        torch.save(sf_sde.state_dict(), SF_SDE_CKPT)
+        if SF_SDE_CKPT.exists():
+            print(f"  [SKIP] Stanford SDE checkpoint already exists at {SF_SDE_CKPT.name}, loading.")
+            sf_sde.load_state_dict(torch.load(SF_SDE_CKPT, map_location=DEVICE, weights_only=False))
+        else:
+            print(f"  SDE: training on {len(ds)} mixed-horizon transitions")
+            for ep in range(1, 31):
+                sf_sde.train(); tl_d = tl_s = 0; n = 0
+                for b in dl:
+                    z = b["z_t"].to(DEVICE); zn = b["z_next"].to(DEVICE)
+                    k = b["k"].float().unsqueeze(-1).to(DEVICE)
+                    t = (k / 30.0)
+                    cti = b["cti_t"].unsqueeze(-1).to(DEVICE)
+                    c = b["c_t"].to(DEVICE)
+                    mu = sf_sde.drift(z, t, c)
+                    sigma = sf_sde.diffusion(z, cti)
+                    dz = (zn - z) / k
+                    drift_loss = F.mse_loss(mu, dz)
+                    resid = zn - z - mu * k
+                    target_var = (resid ** 2) / k.clamp(min=1.0)
+                    sigma_sq = sigma.pow(2).clamp(min=1e-6)
+                    diff_loss = F.mse_loss(torch.log(sigma_sq + 1e-8), torch.log(target_var + 1e-8))
+                    loss = drift_loss + 0.5 * diff_loss
+                    opt_sde.zero_grad(); loss.backward()
+                    torch.nn.utils.clip_grad_norm_(sf_sde.parameters(), 1.0); opt_sde.step()
+                    tl_d += drift_loss.item(); tl_s += diff_loss.item(); n += 1
+                print(f"  SDE ep {ep}/30: drift={tl_d/n:.4f} diff={tl_s/n:.4f}")
+            torch.save(sf_sde.state_dict(), SF_SDE_CKPT)
 
         # Score Decoder for Stanford (predict delta-kt over kt-proxy = PV/PV_scale)
         sf_score = CondScoreDecoder(z_dim=64, c_dim=sf_cov_tr.shape[1], predict_mode='delta').to(DEVICE)
