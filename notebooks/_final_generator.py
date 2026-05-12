@@ -2677,46 +2677,42 @@ def _tag_cell(tag):
 HEADER_07A1_MD = """# SolarSDE 07a1 — Golden Foundations (~3-4 hours)
 
 **Run this notebook FIRST.** Produces the Golden CO VAE + latents + physics features +
-extended splits. These artifacts are the foundation everything else builds on.
+extended splits.
 
 ## What this notebook does
 
 | Step | What | Time |
 |------|------|------|
-| Retrain (conditional) | Download CloudCV ~2.6 GB, BMS data, preprocess into splits, train Golden VAE 20 epochs, extract latents + CTI, save kt/ghi_clearsky/physics features, build 90-day extended splits | ~3-4h |
-| Zip + auto-push | Push results to colab_outputs/ on the GitHub repo | <5 min |
+| Retrain | Download CloudCV ~2.6 GB, BMS data, preprocess into splits, train Golden VAE 20 epochs, extract latents + CTI, save kt/ghi_clearsky/physics features, build 90-day extended splits | ~3-4h |
+| Zip outputs | Final cell zips PERSIST_DIR to /kaggle/working/ for download | <5 min |
 
-**Skip behavior:** if the GitHub repo already has cached Golden artifacts, the soft
-fast-start pulls them and this entire stage skips in ~30 seconds.
-
-## Kaggle setup
+## Kaggle workflow
 
 1. Enable P100 GPU + Internet (Settings panel)
-2. Add a Kaggle Secret named `GITHUB_PAT` with your GitHub Personal Access Token
-   (Settings → Secrets → Add Secret, value = your PAT with `repo` scope from
-   github.com/settings/tokens/new). Without this, auto-push silently skips and
-   you'll need to manually download outputs.
-3. Run all cells. Auto-push at the end syncs results to GitHub so 07a2 can use them.
+2. Run all cells
+3. When done, download `solarsde_outputs_combined.zip` from the **Output** tab on the right sidebar (or click "Save Version → Save & Run All" to save as a Kaggle dataset)
+4. Share the zip with the next notebook by either:
+   - **Easiest**: attach this notebook's saved Output as a dataset input in 07a2
+   - Or unzip manually to `/kaggle/working/solarsde_outputs/` in 07a2
 """
 
 HEADER_07A2_MD = """# SolarSDE 07a2 — Stanford SKIPP'D Pipeline (~6-8 hours)
 
-**Run 07a1 FIRST.** This notebook needs the Golden artifacts pushed by 07a1.
+**Run 07a1 FIRST.** This notebook needs the Golden artifacts from 07a1.
 
 ## What this notebook does
 
 | Step | What | Time |
 |------|------|------|
 | Stanford SKIPP'D | Download HDF5 ~4.4 GB, train Stanford VAE 30 epochs, extract latents + CTI, train Stanford SDE + Score Decoder 30 epochs each, evaluate at horizons [1,5,10,20,30] min | ~6-8h |
-| Zip + auto-push | Push Stanford artifacts to colab_outputs/ on the GitHub repo | <5 min |
+| Zip outputs | Final cell zips PERSIST_DIR to /kaggle/working/ for download | <5 min |
 
-**Skip behavior:** if Stanford artifacts exist, all sub-stages skip individually.
+## Kaggle workflow
 
-## Kaggle setup
-
-1. Same as 07a1 (P100 + Internet + GITHUB_PAT secret).
-2. Soft fast-start will pull Golden artifacts from main (pushed by 07a1).
-3. Run all cells.
+1. Enable P100 GPU + Internet
+2. **Attach 07a1's output** as a dataset input (Add Data → Your Datasets → select your 07a1 saved version)
+3. Run all cells. The setup cell looks for Golden artifacts in standard locations.
+4. Download `solarsde_outputs_combined.zip` from Output tab when done.
 """
 
 HEADER_07B_MD = """# SolarSDE 07b — Training (~4-5 hours)
@@ -2730,9 +2726,13 @@ HEADER_07B_MD = """# SolarSDE 07b — Training (~4-5 hours)
 | Image features | Optical flow + sun-ROI + cloud fraction on Golden | ~30 min |
 | Train SolarSDE | Latent Neural SDE + Cond Score Decoder on Golden, seed 42 | ~3-4h |
 | Multi-seed (off by default) | Seeds 123, 456 — toggle ENABLE_MULTISEED=True in Stage C2 cell | +4-6h if on |
-| Zip + auto-push | Sync to GitHub | <5 min |
+| Zip outputs | Final cell zips PERSIST_DIR to /kaggle/working/ for download | <5 min |
 
 Single-seed run is standard for Energy Reports submissions.
+
+## Kaggle workflow
+
+Attach 07a1 + 07a2 outputs as dataset inputs, run all, download the zip.
 """
 
 HEADER_07C_MD = """# SolarSDE 07c — Evaluation & Figures (~6-8 hours)
@@ -2769,7 +2769,11 @@ HEADER_07C_MD = """# SolarSDE 07c — Evaluation & Figures (~6-8 hours)
 | M  | Analysis figures (CTI, regime, forecast traces) | 15 min |
 | N  | Publication figures + LaTeX tables | <10 min |
 
-Final auto-push uploads tables + figures + zip to GitHub.
+Final cell zips the paper package (tables + figures + everything) to `/kaggle/working/` for download from the Output tab.
+
+## Kaggle workflow
+
+Attach 07a1 + 07a2 + 07b outputs as dataset inputs, run all, download the final zip.
 """
 
 
@@ -2782,11 +2786,8 @@ def nb_07a1():
         + [
             ("markdown", "## 2. Load data tensors (verifies retrain produced everything)"),
             ("code", LOAD_DATA_TOLERANT_CODE),
-            ("markdown", "## Final: zip outputs"),
+            ("markdown", "## Final: zip outputs for Kaggle download"),
             ("code", ZIP_DOWNLOAD_CODE),
-            ("markdown", "## Auto-push results to GitHub"),
-            _tag_cell("07a1_golden_foundations"),
-            ("code", AUTO_PUSH_CODE),
         ]
     )
     return build_nb(cells)
@@ -2804,11 +2805,8 @@ def nb_07a2():
             ("code", LOAD_DATA_TOLERANT_CODE),
             ("markdown", "## STAGE A — Stanford SKIPP'D as full second site"),
             ("code", STANFORD_FULL_PIPELINE_CODE),
-            ("markdown", "## Final: zip outputs"),
+            ("markdown", "## Final: zip outputs for Kaggle download"),
             ("code", ZIP_DOWNLOAD_CODE),
-            ("markdown", "## Auto-push results to GitHub"),
-            _tag_cell("07a2_stanford_pipeline"),
-            ("code", AUTO_PUSH_CODE),
         ]
     )
     return build_nb(cells)
@@ -2830,11 +2828,8 @@ def nb_07b():
             ("code", STAGE0_CODE),
             ("markdown", "## STAGE C2 — Multi-seed runs (off by default; flip ENABLE_MULTISEED=True to enable)"),
             ("code", MULTISEED_CODE),
-            ("markdown", "## Final: zip outputs"),
+            ("markdown", "## Final: zip outputs for Kaggle download"),
             ("code", ZIP_DOWNLOAD_CODE),
-            ("markdown", "## Auto-push results to GitHub"),
-            _tag_cell("07b_training"),
-            ("code", AUTO_PUSH_CODE),
         ]
     )
     return build_nb(cells)
@@ -2878,10 +2873,8 @@ def nb_07c():
             ("markdown", "## STAGE N — Publication figures + LaTeX tables"),
             ("code", PUB_FIGURES_CODE),
             ("code", LATEX_TABLES_CODE),
-            ("markdown", "## Final: zip + auto-push the paper package"),
+            ("markdown", "## Final: zip the paper package for Kaggle download"),
             ("code", ZIP_DOWNLOAD_CODE),
-            _tag_cell("07c_evaluation"),
-            ("code", AUTO_PUSH_CODE),
         ]
     )
     return build_nb(cells)
