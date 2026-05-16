@@ -36,6 +36,10 @@ from _final_generator import (
 from _colab_master_generator import (
     K_FOLD_CV_CODE, CTI_VALIDATION_CODE, HOLM_BONFERRONI_CODE,
 )
+from _master_hardening import (
+    PREFLIGHT_SANITY_CODE, POST_STAGE0_VERIFY_CODE,
+    STAGE_M1_SAFE_FALLBACK_CODE,
+)
 
 
 HEADER_08A_MD = """# SolarSDE Master Part 1 — Foundations + Training + Cross-Validation
@@ -325,6 +329,8 @@ def nb_08a_kaggle():
         ("markdown", "## 0. Setup (Kaggle)"),
         ("code", KAGGLE_SETUP_PART1_CODE),
         ("code", FAST_START_KAGGLE_CODE),
+        ("markdown", "## 0a. Preflight sanity check (catches missing names + corrupt ckpts early)"),
+        ("code", PREFLIGHT_SANITY_CODE),
 
         ("markdown", "## 1. Shared model definitions"),
         ("code", SHARED_CODE),
@@ -351,10 +357,12 @@ def nb_08a_kaggle():
         ("code", LOAD_DATA_TOLERANT_CODE),
 
         ("markdown", "## STAGE B — Image features (optical flow + sun-ROI + cloud fraction)"),
+        ("code", STAGE_M1_SAFE_FALLBACK_CODE),
         ("code", STAGE_MINUS1_CODE),
 
         ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
         ("code", STAGE0_CODE),
+        ("code", POST_STAGE0_VERIFY_CODE),
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation (reviewer requirement)"),
         ("code", K_FOLD_CV_CODE),
@@ -372,6 +380,8 @@ def nb_08b_kaggle():
         ("markdown", "## 0. Setup (Kaggle — Part 2)"),
         ("code", KAGGLE_SETUP_PART2_CODE),
         ("code", FAST_START_KAGGLE_CODE),
+        ("markdown", "## 0a. Preflight sanity check"),
+        ("code", PREFLIGHT_SANITY_CODE),
         ("markdown", "## Prerequisite check"),
         ("code", PREREQ_CHECK_PART2_CODE),
 

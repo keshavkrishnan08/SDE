@@ -36,6 +36,10 @@ from _combined_generator import (
     BASELINES_CODE, ABLATIONS_CODE,
     CALIBRATION_CODE, STRATIFIED_CODE, ANALYSIS_CODE,
 )
+from _master_hardening import (
+    PREFLIGHT_SANITY_CODE, STAGE_M1_SAFE_FALLBACK_CODE,
+    POST_STAGE0_VERIFY_CODE,
+)
 from _generator import (
     CLOUDCV_DOWNLOAD, CLOUDCV_EXTRACT, BMS_DOWNLOAD, PREPROCESS_CODE,
     VAE_MODEL, IMAGE_DATASET, VAE_TRAIN, LATENT_EXTRACT,
@@ -568,6 +572,8 @@ def master_nb():
         ("markdown", "## 0. Setup (Colab + Drive)"),
         ("code", SETUP_COLAB_CODE),
         ("code", FAST_START_GITHUB_CODE),
+        ("markdown", "## 0a. Preflight sanity check (catches missing names + corrupt ckpts early)"),
+        ("code", PREFLIGHT_SANITY_CODE),
 
         ("markdown", "## 1. Shared model definitions"),
         ("code", SHARED_CODE),
@@ -594,10 +600,12 @@ def master_nb():
         ("code", LOAD_DATA_TOLERANT_CODE),
 
         ("markdown", "## STAGE B — Image features (optical flow + sun-ROI + cloud fraction)"),
+        ("code", STAGE_M1_SAFE_FALLBACK_CODE),
         ("code", STAGE_MINUS1_CODE),
 
         ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
         ("code", STAGE0_CODE),
+        ("code", POST_STAGE0_VERIFY_CODE),
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation (reviewer requirement)"),
         ("code", K_FOLD_CV_CODE),
