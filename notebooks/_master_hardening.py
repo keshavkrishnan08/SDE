@@ -19,20 +19,25 @@ PREFLIGHT_SANITY_CODE = '''\
 # ==== PREFLIGHT — sanity check before any heavy work ====
 import shutil as _shutil
 _required_names = [
+    # Gates + checkpoint paths from FAST_START
     "NEED_NB2_TRAINING", "SDE_CKPT", "SCORE_CKPT",
     "HAVE_VAE", "HAVE_SPLITS", "HAVE_LATENTS",
     "HAVE_KT", "HAVE_PHYS", "HAVE_EXTENDED", "HAVE_EXT",
     "NEED_GOLDEN_RETRAIN",
+    # Paths + device from setup
     "DEVICE", "DATA_DIR", "WORK_DIR", "PERSIST_DIR",
     "CHECKPOINT_DIR", "LATENT_DIR", "SPLITS_DIR",
     "EXTENDED_DIR", "RESULTS_DIR", "FIGURES_DIR",
+    # Imports that STAGE0 / training / BASELINES blocks need in scope
+    "Dataset", "DataLoader", "torch", "nn", "F", "np", "pd", "tqdm",
+    "time", "gc", "math",
 ]
 _missing = [n for n in _required_names if n not in globals()]
 if _missing:
     raise NameError(
-        f"PREFLIGHT FAIL: fast-start cell did not publish required names: "
-        f"{_missing}. Re-run the FAST_START cell, or pull the latest "
-        f"notebook from GitHub.")
+        f"PREFLIGHT FAIL: setup/fast-start cells did not publish required "
+        f"names: {_missing}. Re-run the SETUP and FAST_START cells, or pull "
+        f"the latest notebook from GitHub.")
 
 # Validate any existing checkpoints are loadable and not NaN-poisoned.
 _corrupt = []
