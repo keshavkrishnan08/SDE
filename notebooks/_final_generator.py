@@ -36,8 +36,79 @@ from _combined_generator import (
     STAGE_MINUS1_CODE, STAGE0_CODE,
     BASELINES_CODE, ABLATIONS_CODE,
     CALIBRATION_CODE, STRATIFIED_CODE, ANALYSIS_CODE,
-    ZIP_DOWNLOAD_CODE,
 )
+
+
+# Override the imported ZIP_DOWNLOAD_CODE with a minimal-output variant:
+# Kaggle's Output tab shows everything in /kaggle/working/. We zip PERSIST_DIR,
+# delete the unzipped tree (already inside the zip), and delete WORK_DIR (raw
+# data — regeneratable). End state: /kaggle/working/ contains ONLY the zip +
+# a small summary.csv. Saves user 100+ files of clicking through Output tab.
+ZIP_DOWNLOAD_CODE = '''\
+# ==== Zip outputs and clean up to a single file for easy Kaggle download ====
+import shutil
+
+# Set this to False if you want to keep intermediate files for debugging
+MINIMAL_OUTPUT = True
+
+zip_path = Path("/kaggle/working/solarsde_outputs.zip") if IN_KAGGLE else (WORK_DIR / "solarsde_outputs.zip")
+if zip_path.exists():
+    zip_path.unlink()
+print(f"Zipping {PERSIST_DIR} -> {zip_path.name} ...")
+shutil.make_archive(str(zip_path).replace(".zip", ""), "zip", root_dir=PERSIST_DIR)
+size_mb = zip_path.stat().st_size / 1e6
+print(f"  Archive size: {size_mb:.1f} MB")
+
+# Print summary table of contents before optional cleanup
+print("\\n" + "=" * 70)
+print("ALL STAGES COMPLETE")
+print("=" * 70)
+summary_rows = []
+for sub in ["splits", "extended", "checkpoints", "latents", "results", "figures"]:
+    p = PERSIST_DIR / sub
+    if p.exists():
+        n = sum(1 for _ in p.rglob("*") if _.is_file())
+        total = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        print(f"  {sub}/: {n} files, {total/1e6:.1f} MB")
+        summary_rows.append({"folder": sub, "files": n, "size_mb": total / 1e6})
+
+# Save a tiny summary CSV alongside the zip — useful for a quick peek without unzipping
+summary_csv = (Path("/kaggle/working") if IN_KAGGLE else WORK_DIR) / "solarsde_outputs_summary.csv"
+import pandas as pd
+pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
+
+if MINIMAL_OUTPUT and IN_KAGGLE:
+    # Clean up: delete the unzipped PERSIST_DIR and the raw-data WORK_DIR.
+    # The zip contains everything from PERSIST_DIR. WORK_DIR holds raw downloads
+    # (CloudCV tarballs, SKIPP'D HDF5, BMS CSV) which are regeneratable.
+    print(f"\\nCleaning intermediate files (MINIMAL_OUTPUT=True) ...")
+    try:
+        shutil.rmtree(PERSIST_DIR, ignore_errors=True)
+        print(f"  removed {PERSIST_DIR.name}/ (contents archived in zip)")
+    except Exception as e:
+        print(f"  could not remove PERSIST_DIR: {e}")
+    try:
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
+        print(f"  removed {WORK_DIR.name}/ (raw downloads)")
+    except Exception as e:
+        print(f"  could not remove WORK_DIR: {e}")
+    # List what remains in /kaggle/working/
+    remaining = list(Path("/kaggle/working").iterdir())
+    print(f"\\nFinal /kaggle/working/ contents ({len(remaining)} entries):")
+    for f in sorted(remaining):
+        size = f.stat().st_size / 1e6
+        print(f"  {f.name}  ({size:.1f} MB)" if f.is_file() else f"  {f.name}/")
+
+if IN_COLAB:
+    from google.colab import files
+    try: files.download(str(zip_path))
+    except Exception as e: print(f"Auto-download failed: {e}. File at {zip_path}")
+elif IN_KAGGLE:
+    print(f"\\nDownload the zip from the Output tab on the right sidebar.")
+    print(f"Or 'Save Version' to commit /kaggle/working/ as a Kaggle Dataset for the next notebook.")
+else:
+    print(f"\\nLocal: file at {zip_path}")
+'''
 # Pull Notebook 1's data download + VAE training blocks for the from-scratch path.
 # CLOUDCV_DOWNLOAD and CLOUDCV_EXTRACT are replaced with robust versions below
 # that add retry logic + size validation + tar corruption recovery.
