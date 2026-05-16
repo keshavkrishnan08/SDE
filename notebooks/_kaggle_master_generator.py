@@ -288,6 +288,12 @@ HAVE_EXTENDED = (EXTENDED_DIR / "train.parquet").exists()
 HAVE_EXT      = HAVE_EXTENDED   # alias for backward compat with LOAD_DATA_TOLERANT_CODE
 NEED_GOLDEN_RETRAIN = not (HAVE_VAE and HAVE_SPLITS and HAVE_LATENTS and HAVE_KT and HAVE_PHYS)
 print(f"NEED_GOLDEN_RETRAIN = {NEED_GOLDEN_RETRAIN}")
+
+# ==== Stage-0 retraining gate (consumed by STAGE0_CODE) ====
+SDE_CKPT   = CHECKPOINT_DIR / "sde_best.pt"
+SCORE_CKPT = CHECKPOINT_DIR / "score_best.pt"
+NEED_NB2_TRAINING = not (SDE_CKPT.exists() and SCORE_CKPT.exists())
+print(f"NEED_NB2_TRAINING   = {NEED_NB2_TRAINING}  (SDE+Score will be trained inline if True)")
 '''
 
 
