@@ -277,17 +277,18 @@ else:
     # Indices of each day in the full train tensor arrays
     day_idx = {d: tr_df.index[tr_df["date"] == d].tolist() for d in days}
 
-    # Load all latents/cov/etc.
-    z_all   = np.load(LATENT_DIR / "train_latents.npy")
-    cti_all = np.load(LATENT_DIR / "train_cti.npy")
-    kt_all  = np.load(LATENT_DIR / "train_kt.npy")
-    cov_all = np.concatenate([
-        np.load(LATENT_DIR / "train_covariates.npy"),
-        np.load(LATENT_DIR / "train_physics_features.npy"),
-    ] + ([np.load(LATENT_DIR / "train_image_features.npy")]
-         if (LATENT_DIR / "train_image_features.npy").exists() else []), axis=1).astype(np.float32)
-    ghi_all = np.load(LATENT_DIR / "train_ghi.npy")
-    gcs_all = np.load(LATENT_DIR / "train_ghi_clearsky.npy")
+    # Pull from the already-loaded `data` dict so the cov dim matches what
+    # STAGE 0 was trained with. (Re-reading from disk + concat'ing image
+    # features can drift if STAGE_M1_SAFE_FALLBACK wrote zero-fill features
+    # AFTER LOAD_DATA had already set C_DIM.)
+    z_all   = data["train"]["Z"]
+    cti_all = data["train"]["cti"]
+    kt_all  = data["train"]["kt"]
+    cov_all = data["train"]["cov"]
+    ghi_all = data["train"]["ghi"]
+    gcs_all = data["train"]["gcs"]
+    c_dim_fold = cov_all.shape[1]
+    print(f"  CV cov dim: {c_dim_fold}  (matches C_DIM={C_DIM} from LOAD_DATA: {c_dim_fold == C_DIM})")
 
     fold_rows = []
     for fold_i, holdout_day in enumerate(days):
@@ -330,7 +331,7 @@ else:
         mh = MHDS_CV(z_tr_fold, cti_tr_fold, cov_tr_fold, seed=42 + fold_i)
         dl = DataLoader(mh, batch_size=512, shuffle=True, num_workers=2,
                         pin_memory=True, drop_last=True)
-        sde_cv = LatentNeuralSDE(z_dim=Z_DIM, c_dim=C_DIM).to(DEVICE)
+        sde_cv = LatentNeuralSDE(z_dim=Z_DIM, c_dim=c_dim_fold).to(DEVICE)
         opt = torch.optim.Adam(sde_cv.parameters(), lr=5e-4)
         for ep in range(1, 21):   # 20 epochs (vs 30 for main model)
             sde_cv.train(); tl = 0; n = 0
@@ -364,7 +365,7 @@ else:
                         "z_t": torch.from_numpy(self.z[i]),
                         "cti_t": torch.tensor(self.cti[i], dtype=torch.float32),
                         "c_t": torch.from_numpy(self.c[i])}
-        score_cv = CondScoreDecoder(z_dim=Z_DIM, c_dim=C_DIM, predict_mode='delta').to(DEVICE)
+        score_cv = CondScoreDecoder(z_dim=Z_DIM, c_dim=c_dim_fold, predict_mode='delta').to(DEVICE)
         opt2 = torch.optim.Adam(score_cv.parameters(), lr=1e-4)
         sds = SDS_CV(z_tr_fold, cti_tr_fold, cov_tr_fold, kt_tr_fold, seed=42 + fold_i)
         sdl = DataLoader(sds, batch_size=512, shuffle=True, num_workers=2,
@@ -395,7 +396,7 @@ else:
                 cti0 = torch.from_numpy(cti_te_fold[i:end]).unsqueeze(-1).to(DEVICE)
                 cti0 = cti0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, 1)
                 c0 = torch.from_numpy(cov_te_fold[i:end]).to(DEVICE)
-                c0 = c0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, C_DIM)
+                c0 = c0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, c_dim_fold)
                 kt0 = torch.from_numpy(kt_te_fold[i:end]).unsqueeze(-1).to(DEVICE)
                 kt0 = kt0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, 1)
                 with torch.no_grad():
@@ -597,12 +598,15 @@ def master_nb():
         ("code", GOLDEN_KT_PHYS_CODE),
         ("code", GOLDEN_EXTENDED_CODE),
 
-        ("markdown", "## 2. Load data tensors"),
-        ("code", LOAD_DATA_TOLERANT_CODE),
-
-        ("markdown", "## STAGE B — Image features (optical flow + sun-ROI + cloud fraction)"),
+        ("markdown", "## STAGE B — Image-feature pre-flight + extraction"),
+        # Fallback runs BEFORE LOAD_DATA so cov dim is consistent from the
+        # very first load — and any stale zero-fill that would mismatch an
+        # existing SDE ckpt's c_dim is deleted up front.
         ("code", STAGE_M1_SAFE_FALLBACK_CODE),
         ("code", STAGE_MINUS1_CODE),
+
+        ("markdown", "## 2. Load data tensors"),
+        ("code", LOAD_DATA_TOLERANT_CODE),
 
         ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
         ("code", STAGE0_CODE),

@@ -355,12 +355,15 @@ def nb_08a_kaggle():
         ("code", GOLDEN_KT_PHYS_CODE),
         ("code", GOLDEN_EXTENDED_CODE),
 
-        ("markdown", "## 2. Load data tensors"),
-        ("code", LOAD_DATA_TOLERANT_CODE),
-
-        ("markdown", "## STAGE B — Image features (optical flow + sun-ROI + cloud fraction)"),
+        ("markdown", "## STAGE B — Image-feature pre-flight + extraction"),
+        # Fallback runs BEFORE LOAD_DATA so cov dim is consistent from the
+        # very first load — and any stale zero-fill that would mismatch an
+        # existing SDE ckpt's c_dim is deleted up front.
         ("code", STAGE_M1_SAFE_FALLBACK_CODE),
         ("code", STAGE_MINUS1_CODE),
+
+        ("markdown", "## 2. Load data tensors"),
+        ("code", LOAD_DATA_TOLERANT_CODE),
 
         ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
         ("code", STAGE0_CODE),

@@ -121,6 +121,40 @@ print("[OK] STAGE 0 checkpoints verified (no NaN/Inf weights).")
 # ============================================================
 STAGE_M1_SAFE_FALLBACK_CODE = '''\
 # ==== Pre-STAGE -1 fallback (path-fix + safe skip) ====
+
+# --- First: detect stale zero-fill image_features.npy that would inflate
+# cov dim past a previously-saved SDE checkpoint's training-time c_dim.
+# If we wrote zero-fill features on a prior run BEFORE STAGE 0 trained, the
+# ckpt expects (cov+phys+img) dim. If we wrote them AFTER STAGE 0 trained
+# without images, the ckpt expects (cov+phys) only, and loading it against
+# the larger cov will crash with shape-mismatch. Detect + delete those.
+if SDE_CKPT.exists():
+    try:
+        _sd = torch.load(SDE_CKPT, map_location="cpu", weights_only=False)
+        _first_w_key = next(k for k in _sd if k.endswith("drift.net.0.weight"))
+        _ckpt_input_dim = _sd[_first_w_key].shape[1]
+        _ckpt_c_dim = _ckpt_input_dim - 64 - 1   # z_dim=64, time=1
+        for _s in ["train", "val", "test"]:
+            _f = LATENT_DIR / f"{_s}_image_features.npy"
+            if not _f.exists(): continue
+            _arr = np.load(_f)
+            if _arr.size == 0 or not (_arr == 0).all():
+                continue   # real (non-zero) features — leave them alone
+            _orig = np.load(LATENT_DIR / f"{_s}_covariates.npy")
+            _phys = np.load(LATENT_DIR / f"{_s}_physics_features.npy")
+            _base_dim = _orig.shape[1] + _phys.shape[1]
+            _with_img = _base_dim + _arr.shape[1]
+            if _ckpt_c_dim == _base_dim and _ckpt_c_dim != _with_img:
+                print(f"  [FIX] Deleting stale zero-fill {_f.name} "
+                      f"(ckpt c_dim={_ckpt_c_dim}, would inflate to {_with_img}).")
+                _f.unlink()
+            elif _ckpt_c_dim != _base_dim and _ckpt_c_dim != _with_img:
+                print(f"  [WARN] {_f.name}: ckpt c_dim={_ckpt_c_dim} matches "
+                      f"neither {_base_dim} nor {_with_img}. Leaving in place.")
+        del _sd
+    except Exception as _e:
+        print(f"  [WARN] could not infer ckpt c_dim ({_e}); skipping zero-fill check.")
+
 _have_feats = all((LATENT_DIR / f"{s}_image_features.npy").exists()
                   for s in ["train", "val", "test"])
 if _have_feats:
