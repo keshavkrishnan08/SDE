@@ -1206,6 +1206,45 @@ else:
         print(f"                     RMSE = {rmse_mu:.2f}  [{rmse_lo:.2f}, {rmse_hi:.2f}]")
         print(f"                     MAE  = {mae_mu:.2f}  [{mae_lo:.2f}, {mae_hi:.2f}]")
 
+# Bootstrap CIs at ALL horizons (using per-horizon prediction npz from Stage C+)
+PREDS_DIR_B = RESULTS_DIR / "per_horizon_preds"
+all_boot_rows = []
+if PREDS_DIR_B.exists():
+    horizons_min = [HORIZON_MIN[h] for h in HORIZONS]
+    print("\\nBootstrap CIs at all horizons:")
+    for h_min in horizons_min:
+        npz_p = PREDS_DIR_B / f"solarsde_h{h_min}.npz"
+        if not npz_p.exists():
+            continue
+        npz = np.load(npz_p)
+        preds, tru = npz["preds"], npz["truths"]
+        ps_crps = np.array([crps_empirical(tru[i:i+1], preds[i:i+1])[0] for i in range(len(tru))])
+        ps_se = (preds.mean(1) - tru) ** 2
+        ps_mae = np.abs(preds.mean(1) - tru)
+        c_mu, c_lo, c_hi = bootstrap_ci(ps_crps)
+        r_mu, r_lo, r_hi = bootstrap_ci(ps_se, agg=lambda x: float(np.sqrt(x.mean())))
+        m_mu, m_lo, m_hi = bootstrap_ci(ps_mae)
+        # Skill score vs persistence baseline if available
+        pers_p = RESULTS_DIR / "baseline_persistence_results.csv"
+        skill = float("nan")
+        if pers_p.exists():
+            pers_df = pd.read_csv(pers_p)
+            pers_h = pers_df[pers_df["horizon_min"] == h_min]
+            if len(pers_h):
+                skill = 1.0 - c_mu / float(pers_h["crps"].iloc[0])
+        all_boot_rows.append({
+            "horizon_min": h_min,
+            "crps": c_mu, "crps_lo": c_lo, "crps_hi": c_hi,
+            "rmse": r_mu, "rmse_lo": r_lo, "rmse_hi": r_hi,
+            "mae":  m_mu, "mae_lo":  m_lo, "mae_hi":  m_hi,
+            "skill_vs_persistence": skill,
+        })
+        print(f"  h={h_min:2d}min  CRPS={c_mu:6.2f} [{c_lo:5.2f}, {c_hi:5.2f}]  "
+              f"RMSE={r_mu:6.2f} [{r_lo:5.2f}, {r_hi:5.2f}]  skill={skill:+.2%}")
+    if all_boot_rows:
+        pd.DataFrame(all_boot_rows).to_csv(RESULTS_DIR / "bootstrap_cis_all_horizons.csv", index=False)
+        print("  -> saved bootstrap_cis_all_horizons.csv")
+
 # Bootstrap on per-model summary CSVs (point estimates without CIs but at least
 # we can quote the spread across the 3 multi-seed runs as a proxy CI for SolarSDE).
 ms_path = RESULTS_DIR / "solarsde_multiseed_summary.csv"
@@ -1519,6 +1558,92 @@ else:
 # ----------------------------------------------------------------
 # COMPUTATIONAL BENCHMARK: params + train time + inference latency
 # ----------------------------------------------------------------
+
+RAMP_AUROC_CODE = '''\
+# ==== Ramp detection AUROC + CTI lead-time analysis ====
+# Two ramp-event experiments that round out the paper story:
+#
+# 1. Ramp detection AUROC: at each test timestamp, use the 90% PI width as a
+#    "ramp likelihood" score. Sweep threshold and compute AUROC vs the actual
+#    ramp label. A good probabilistic model should widen its PI before a ramp.
+#
+# 2. CTI lead-time: for each observed ramp event, look at CTI(t-k) for k in
+#    [-5, +30] timesteps. If CTI rises before the ramp, it has predictive
+#    value as an early-warning indicator — a strong operational story.
+
+from sklearn.metrics import roc_auc_score
+
+te = data["test"]
+ramp = te["ramp"].astype(bool)
+cti = te["cti"]
+print(f"Ramp events in test: {int(ramp.sum())} ({100*ramp.mean():.1f}% of timestamps)")
+
+# ---- 1. AUROC of PI width as ramp indicator ----
+auroc_rows = []
+for h_min in [HORIZON_MIN[h] for h in HORIZONS]:
+    npz_p = RESULTS_DIR / "per_horizon_preds" / f"solarsde_h{h_min}.npz"
+    if not npz_p.exists():
+        continue
+    npz = np.load(npz_p)
+    preds = npz["preds"]   # (n_eval, n_samples)
+    # PI width = 95th - 5th percentile across MC samples
+    pi_width = np.percentile(preds, 95, axis=1) - np.percentile(preds, 5, axis=1)
+    # Align ramp labels to the first n_eval timestamps
+    ramp_h = ramp[:len(pi_width)]
+    if ramp_h.sum() < 5 or ramp_h.sum() == len(ramp_h):
+        continue
+    try:
+        auroc = roc_auc_score(ramp_h.astype(int), pi_width)
+    except ValueError:
+        auroc = float("nan")
+    auroc_rows.append({"horizon_min": h_min, "auroc_pi_width_vs_ramp": auroc,
+                       "n_ramp": int(ramp_h.sum()), "n_total": len(ramp_h)})
+    print(f"  h={h_min:2d}min  Ramp AUROC (PI-width)  = {auroc:.3f}  (n_ramp={int(ramp_h.sum())})")
+
+if auroc_rows:
+    pd.DataFrame(auroc_rows).to_csv(RESULTS_DIR / "ramp_detection_auroc.csv", index=False)
+
+# ---- 2. CTI lead-time: mean CTI in window [-5, +30] around ramp events ----
+W_BEFORE, W_AFTER = 5, 30
+n = len(ramp); cti_windows = []
+for i in np.where(ramp)[0]:
+    if i - W_BEFORE >= 0 and i + W_AFTER + 1 <= n:
+        cti_windows.append(cti[i - W_BEFORE:i + W_AFTER + 1])
+if cti_windows:
+    cti_stack = np.stack(cti_windows, axis=0)   # (n_events, W_BEFORE + W_AFTER + 1)
+    cti_mean = cti_stack.mean(axis=0)
+    cti_std  = cti_stack.std(axis=0)
+    offsets = np.arange(-W_BEFORE, W_AFTER + 1)
+
+    # Mean CTI before vs at vs after ramp
+    cti_pre  = cti_stack[:, :W_BEFORE].mean()
+    cti_at   = cti_stack[:, W_BEFORE]
+    cti_post = cti_stack[:, W_BEFORE+1:W_BEFORE+W_AFTER+1].mean()
+    print(f"\\nCTI around ramp events ({len(cti_windows)} events):")
+    print(f"  mean CTI in {W_BEFORE} steps BEFORE ramp: {cti_pre:.4f}")
+    print(f"  mean CTI AT ramp (t=0):                   {float(cti_at.mean()):.4f}")
+    print(f"  mean CTI in {W_AFTER} steps AFTER ramp:   {cti_post:.4f}")
+    print(f"  CTI rise from before to at-ramp: {(float(cti_at.mean())-cti_pre)/(cti_pre+1e-9)*100:+.1f}%")
+
+    # Save the lead-time profile + plot
+    df_lead = pd.DataFrame({"offset_step": offsets, "cti_mean": cti_mean, "cti_std": cti_std})
+    df_lead.to_csv(RESULTS_DIR / "cti_ramp_lead_time.csv", index=False)
+
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(offsets * 10, cti_mean, "b-", lw=1.5, label="mean CTI")
+    ax.fill_between(offsets * 10, cti_mean - cti_std, cti_mean + cti_std, alpha=0.25, color="b")
+    ax.axvline(0, color="r", ls="--", lw=0.8, label="ramp event (t=0)")
+    ax.set_xlabel("time relative to ramp (seconds)")
+    ax.set_ylabel("CTI")
+    ax.set_title(f"CTI dynamics around {len(cti_windows)} ramp events")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / "cti_ramp_leadtime.pdf", bbox_inches="tight")
+    plt.savefig(FIGURES_DIR / "cti_ramp_leadtime.png", bbox_inches="tight", dpi=150)
+    plt.show()
+'''
+
 
 CORRECTED_INFERENCE_CODE = '''\
 # ==== Corrected inference: advance time-deterministic covariates per rollout step ====
@@ -2868,6 +2993,8 @@ def nb_07c():
             ("markdown", "## STAGE I — PIT + reliability + sharpness + bootstrap CIs"),
             ("code", PIT_RELIABILITY_CODE),
             ("code", BOOTSTRAP_CIS_CODE),
+            ("markdown", "## STAGE I+ — Ramp detection AUROC + CTI lead-time"),
+            ("code", RAMP_AUROC_CODE),
             ("markdown", "## STAGE J — Cross-site transfer"),
             ("code", CROSSSITE_CODE),
             ("markdown", "## STAGE K — Economic value (CAISO)"),
