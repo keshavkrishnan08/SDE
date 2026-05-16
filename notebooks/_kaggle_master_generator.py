@@ -101,7 +101,7 @@ Dataset before running this notebook.
 
 KAGGLE_SETUP_PART1_CODE = '''\
 # ==== Kaggle setup (Part 1) ====
-import os, sys
+import os, sys, shutil
 from pathlib import Path
 
 IN_KAGGLE = os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None
@@ -116,6 +116,30 @@ for d in [PERSIST_DIR, WORK_DIR,
           PERSIST_DIR / "latents",     PERSIST_DIR / "splits",
           PERSIST_DIR / "extended",    PERSIST_DIR / "figures"]:
     d.mkdir(parents=True, exist_ok=True)
+
+# If you attached your previous solarsde_outputs folder as a Kaggle dataset
+# (e.g., from a 07a1 run), auto-copy it in so the retrain stage skips.
+if IN_KAGGLE:
+    src_root = Path("/kaggle/input")
+    if src_root.exists():
+        print("Checking attached Kaggle datasets for cached artifacts ...")
+        for ds in src_root.iterdir():
+            if not ds.is_dir(): continue
+            looks_cached = ((ds / "checkpoints").exists()
+                            or (ds / "splits").exists()
+                            or (ds / "latents").exists())
+            if not looks_cached: continue
+            print(f"  found candidate: {ds.name}")
+            for sub in ds.iterdir():
+                if not sub.is_dir(): continue
+                dst = PERSIST_DIR / sub.name
+                if dst.exists() and any(dst.iterdir()):
+                    print(f"    skip {sub.name}/ (already populated)")
+                    continue
+                if dst.exists(): shutil.rmtree(dst)
+                shutil.copytree(sub, dst)
+                n = sum(1 for _ in dst.rglob("*") if _.is_file())
+                print(f"    copied {sub.name}/ ({n} files)")
 
 DATA_DIR        = WORK_DIR / "data"
 CHECKPOINT_DIR  = PERSIST_DIR / "checkpoints"
