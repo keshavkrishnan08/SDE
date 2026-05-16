@@ -284,7 +284,8 @@ HAVE_SPLITS  = (SPLITS_DIR / "train.parquet").exists()
 HAVE_LATENTS = all((LATENT_DIR / f"{s}_latents.npy").exists() for s in ["train", "val", "test"])
 HAVE_KT      = all((LATENT_DIR / f"{s}_kt.npy").exists() for s in ["train", "val", "test"])
 HAVE_PHYS    = all((LATENT_DIR / f"{s}_physics_features.npy").exists() for s in ["train", "val", "test"])
-HAVE_EXT     = (EXTENDED_DIR / "train.parquet").exists()
+HAVE_EXTENDED = (EXTENDED_DIR / "train.parquet").exists()
+HAVE_EXT      = HAVE_EXTENDED   # alias for backward compat with LOAD_DATA_TOLERANT_CODE
 NEED_GOLDEN_RETRAIN = not (HAVE_VAE and HAVE_SPLITS and HAVE_LATENTS and HAVE_KT and HAVE_PHYS)
 print(f"NEED_GOLDEN_RETRAIN = {NEED_GOLDEN_RETRAIN}")
 '''
