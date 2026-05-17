@@ -236,6 +236,17 @@ HAVE_EXT      = HAVE_EXTENDED   # alias for backward compat with LOAD_DATA_TOLER
 NEED_GOLDEN_RETRAIN = not (HAVE_VAE and HAVE_SPLITS and HAVE_LATENTS and HAVE_KT and HAVE_PHYS)
 print(f"NEED_GOLDEN_RETRAIN = {NEED_GOLDEN_RETRAIN}")
 
+def _have_real_image_features():
+    import numpy as _np
+    for _s in ["train", "val", "test"]:
+        _p = LATENT_DIR / f"{_s}_image_features.npy"
+        if not _p.exists(): return False
+        _a = _np.load(_p, mmap_mode="r")
+        if _a.size == 0 or not _a.any(): return False
+    return True
+NEED_IMAGE_FEATURES = not _have_real_image_features()
+print(f"NEED_IMAGE_FEATURES = {NEED_IMAGE_FEATURES}")
+
 # ==== Stage-0 retraining gate (consumed by STAGE0_CODE) ====
 SDE_CKPT   = CHECKPOINT_DIR / "sde_best.pt"
 SCORE_CKPT = CHECKPOINT_DIR / "score_best.pt"
@@ -599,9 +610,9 @@ def master_nb():
         ("markdown", "## RETRAIN — Golden CO (skipped if cached)"),
         ("code", GOLDEN_RETRAIN_GUARD_CODE),
         ("code", "LATENT_DIM = 64\nIMG_SIZE = 128\n" + VAE_MODEL),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not all((DATA_DIR / 'cloudcv' / f).exists() "
+        ("code", _gate("(ENABLE_GOLDEN_RETRAIN or NEED_IMAGE_FEATURES) and not all((DATA_DIR / 'cloudcv' / f).exists() "
                        "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD_ROBUST)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT_ROBUST)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN or NEED_IMAGE_FEATURES", CLOUDCV_EXTRACT_ROBUST)),
         ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (DATA_DIR / 'bms' / 'bms_srrl_2019.csv').exists()",
                        BMS_DOWNLOAD)),
         ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (SPLITS_DIR / 'train.parquet').exists()",

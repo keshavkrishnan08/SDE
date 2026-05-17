@@ -295,6 +295,26 @@ HAVE_EXT      = HAVE_EXTENDED   # alias for backward compat with LOAD_DATA_TOLER
 NEED_GOLDEN_RETRAIN = not (HAVE_VAE and HAVE_SPLITS and HAVE_LATENTS and HAVE_KT and HAVE_PHYS)
 print(f"NEED_GOLDEN_RETRAIN = {NEED_GOLDEN_RETRAIN}")
 
+# ==== Image-features gate (independent of Golden retrain) ====
+# True if we don't yet have real (non-zero) image features. The CloudCV
+# download stage will run if this is True, even when NEED_GOLDEN_RETRAIN is
+# False. Lets the user resume from cached latents but still extract real
+# image features (optical flow + sun-ROI + cloud fraction) instead of falling
+# back to zero-fill.
+def _have_real_image_features():
+    import numpy as _np
+    for _s in ["train", "val", "test"]:
+        _p = LATENT_DIR / f"{_s}_image_features.npy"
+        if not _p.exists():
+            return False
+        _a = _np.load(_p, mmap_mode="r")
+        if _a.size == 0 or not _a.any():   # all-zero zero-fill counts as "not real"
+            return False
+    return True
+NEED_IMAGE_FEATURES = not _have_real_image_features()
+print(f"NEED_IMAGE_FEATURES = {NEED_IMAGE_FEATURES}  "
+      f"(triggers CloudCV download even if Golden retrain is skipped)")
+
 # ==== Stage-0 retraining gate (consumed by STAGE0_CODE) ====
 SDE_CKPT   = CHECKPOINT_DIR / "sde_best.pt"
 SCORE_CKPT = CHECKPOINT_DIR / "score_best.pt"
@@ -340,9 +360,13 @@ def nb_08a_kaggle():
         ("markdown", "## RETRAIN — Golden CO (skipped if cached)"),
         ("code", GOLDEN_RETRAIN_GUARD_CODE),
         ("code", "LATENT_DIM = 64\nIMG_SIZE = 128\n" + VAE_MODEL),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not all((DATA_DIR / 'cloudcv' / f).exists() "
+        # CloudCV download is now gated on BOTH ENABLE_GOLDEN_RETRAIN OR
+        # NEED_IMAGE_FEATURES — so even when the user has cached latents +
+        # ckpts (Golden retrain off), the raw images get downloaded if image
+        # features are still zero-fill / missing.
+        ("code", _gate("(ENABLE_GOLDEN_RETRAIN or NEED_IMAGE_FEATURES) and not all((DATA_DIR / 'cloudcv' / f).exists() "
                        "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD_ROBUST)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT_ROBUST)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN or NEED_IMAGE_FEATURES", CLOUDCV_EXTRACT_ROBUST)),
         ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (DATA_DIR / 'bms' / 'bms_srrl_2019.csv').exists()",
                        BMS_DOWNLOAD)),
         ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (SPLITS_DIR / 'train.parquet').exists()",
@@ -484,9 +508,9 @@ def nb_08_kaggle_combined():
         ("markdown", "## RETRAIN — Golden CO (skipped if cached)"),
         ("code", GOLDEN_RETRAIN_GUARD_CODE),
         ("code", "LATENT_DIM = 64\nIMG_SIZE = 128\n" + VAE_MODEL),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN and not all((DATA_DIR / 'cloudcv' / f).exists() "
+        ("code", _gate("(ENABLE_GOLDEN_RETRAIN or NEED_IMAGE_FEATURES) and not all((DATA_DIR / 'cloudcv' / f).exists() "
                        "for f in ['2019_09_07.tar.gz'])", CLOUDCV_DOWNLOAD_ROBUST)),
-        ("code", _gate("ENABLE_GOLDEN_RETRAIN", CLOUDCV_EXTRACT_ROBUST)),
+        ("code", _gate("ENABLE_GOLDEN_RETRAIN or NEED_IMAGE_FEATURES", CLOUDCV_EXTRACT_ROBUST)),
         ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (DATA_DIR / 'bms' / 'bms_srrl_2019.csv').exists()",
                        BMS_DOWNLOAD)),
         ("code", _gate("ENABLE_GOLDEN_RETRAIN and not (SPLITS_DIR / 'train.parquet').exists()",

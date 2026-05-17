@@ -43,7 +43,7 @@ _required_names = [
     "NEED_NB2_TRAINING", "SDE_CKPT", "SCORE_CKPT",
     "HAVE_VAE", "HAVE_SPLITS", "HAVE_LATENTS",
     "HAVE_KT", "HAVE_PHYS", "HAVE_EXTENDED", "HAVE_EXT",
-    "NEED_GOLDEN_RETRAIN",
+    "NEED_GOLDEN_RETRAIN", "NEED_IMAGE_FEATURES",
     # Paths + device from setup
     "DEVICE", "DATA_DIR", "WORK_DIR", "PERSIST_DIR",
     "CHECKPOINT_DIR", "LATENT_DIR", "SPLITS_DIR",
@@ -141,6 +141,18 @@ print("[OK] STAGE 0 checkpoints verified (no NaN/Inf weights).")
 # ============================================================
 STAGE_M1_SAFE_FALLBACK_CODE = '''\
 # ==== Pre-STAGE -1 fallback (path-fix + safe skip) ====
+
+# --- Zero: if NEED_IMAGE_FEATURES is True (we want real features) and any
+# existing zero-fill image_features.npy is on disk, delete it so STAGE -1
+# can extract real features from the just-downloaded CloudCV images.
+if globals().get("NEED_IMAGE_FEATURES", False):
+    for _s in ["train", "val", "test"]:
+        _f = LATENT_DIR / f"{_s}_image_features.npy"
+        if _f.exists():
+            _arr = np.load(_f, mmap_mode="r")
+            if _arr.size > 0 and not _arr.any():
+                print(f"  [REFRESH] Deleting zero-fill {_f.name} so STAGE -1 can extract real features.")
+                _f.unlink()
 
 # --- First: detect stale zero-fill image_features.npy that would inflate
 # cov dim past a previously-saved SDE checkpoint's training-time c_dim.
