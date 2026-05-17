@@ -1,13 +1,33 @@
 """Hardening code blocks shared by the Kaggle (08a/08b) and Colab (08) master
-notebooks.
-
-Defined in their own module to avoid the circular import that would arise from
-``_kaggle_master_generator`` and ``_colab_master_generator`` importing from each
-other.
-
-Each constant is a Python source string that gets dropped into a single notebook
-cell via ``build_nb``.
+notebooks. Also exposes `safe_stage(name, code)` for wrapping analytical
+stage cells in a try/except so a failure in one stage doesn't poison the rest.
 """
+
+
+def safe_stage(name: str, code: str) -> str:
+    """Wrap a stage's code in a try/except that logs the failure and lets
+    subsequent cells continue.
+
+    Critical infrastructure (setup, SHARED_CODE, LOAD_DATA, STAGE 0, POST
+    verify, ZIP) should NOT be wrapped — losing those means the whole run
+    is degenerate. Analytic / figure / table stages SHOULD be wrapped so a
+    single bug doesn't take down the entire 08b run."""
+    # Indent every line of `code` by 4 spaces so it sits inside `try:`.
+    indented = "\n".join(("    " + ln if ln else "") for ln in code.splitlines())
+    return (
+        f"# ==== SAFE STAGE: {name} ====\n"
+        f"import traceback as _tb_safe_stage\n"
+        f"try:\n"
+        f"{indented}\n"
+        f"except Exception as _e_safe_stage:\n"
+        f"    print('\\n' + '!' * 70)\n"
+        f"    print(f'[STAGE FAILED] {name}: "
+        f"{{type(_e_safe_stage).__name__}}: {{_e_safe_stage}}')\n"
+        f"    _tb_safe_stage.print_exc()\n"
+        f"    print(f'[STAGE FAILED] {name} skipped — continuing.')\n"
+        f"    print('!' * 70 + '\\n')\n"
+    )
+
 
 # ============================================================
 # PREFLIGHT_SANITY_CODE — runs right after FAST_START

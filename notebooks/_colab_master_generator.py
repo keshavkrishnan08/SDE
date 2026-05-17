@@ -38,7 +38,7 @@ from _combined_generator import (
 )
 from _master_hardening import (
     PREFLIGHT_SANITY_CODE, STAGE_M1_SAFE_FALLBACK_CODE,
-    POST_STAGE0_VERIFY_CODE,
+    POST_STAGE0_VERIFY_CODE, safe_stage,
 )
 from _generator import (
     CLOUDCV_DOWNLOAD, CLOUDCV_EXTRACT, BMS_DOWNLOAD, PREPROCESS_CODE,
@@ -629,45 +629,45 @@ def master_nb():
         ("code", POST_STAGE0_VERIFY_CODE),
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation (reviewer requirement)"),
-        ("code", K_FOLD_CV_CODE),
+        ("code", safe_stage("K_FOLD_CV", K_FOLD_CV_CODE)),
 
         ("markdown", "## STAGE C+ — Corrected inference (advance time-deterministic covariates)"),
-        ("code", CORRECTED_INFERENCE_CODE),
+        ("code", safe_stage("CORRECTED_INFERENCE", CORRECTED_INFERENCE_CODE)),
 
         ("markdown", "## STAGE D — Standard baselines (persistence, smart-pers, LSTM, MC-Dropout, CSDI)"),
-        ("code", BASELINES_CODE),
+        ("code", safe_stage("BASELINES", BASELINES_CODE)),
 
         ("markdown", "## STAGE F — Ablations A2 (no-CTI), A4 (no-score), A5 (no-SDE), A3 (no-VAE PCA)"),
-        ("code", ABLATIONS_CODE),
-        ("code", EXTRA_ABLATIONS_CODE),
+        ("code", safe_stage("ABLATIONS", ABLATIONS_CODE)),
+        ("code", safe_stage("EXTRA_ABLATIONS", EXTRA_ABLATIONS_CODE)),
 
         ("markdown", "## STAGE G — Conformal calibration"),
-        ("code", CALIBRATION_CODE),
+        ("code", safe_stage("CALIBRATION", CALIBRATION_CODE)),
 
         ("markdown", "## STAGE H — Stratified eval + Diebold-Mariano test"),
-        ("code", STRATIFIED_CODE),
+        ("code", safe_stage("STRATIFIED", STRATIFIED_CODE)),
 
         ("markdown", "## STAGE I — PIT + reliability + sharpness + bootstrap CIs (all horizons)"),
-        ("code", PIT_RELIABILITY_CODE),
-        ("code", BOOTSTRAP_CIS_CODE),
+        ("code", safe_stage("PIT_RELIABILITY", PIT_RELIABILITY_CODE)),
+        ("code", safe_stage("BOOTSTRAP_CIS", BOOTSTRAP_CIS_CODE)),
 
         ("markdown", "## STAGE I+ — Ramp AUROC + CTI lead-time"),
-        ("code", RAMP_AUROC_CODE),
+        ("code", safe_stage("RAMP_AUROC", RAMP_AUROC_CODE)),
 
         ("markdown", "## STAGE I++ — CTI vs cloud-cover validation (physical-meaningfulness)"),
-        ("code", CTI_VALIDATION_CODE),
+        ("code", safe_stage("CTI_VALIDATION", CTI_VALIDATION_CODE)),
 
         ("markdown", "## STAGE I+++ — Holm-Bonferroni multiple-comparison correction"),
-        ("code", HOLM_BONFERRONI_CODE),
+        ("code", safe_stage("HOLM_BONFERRONI", HOLM_BONFERRONI_CODE)),
 
         ("markdown", "## STAGE K — Economic value (CAISO reserve simulation)"),
-        ("code", ECONOMIC_CAISO_CODE),
+        ("code", safe_stage("ECONOMIC_CAISO", ECONOMIC_CAISO_CODE)),
 
         ("markdown", "## STAGE M — Analysis figures (CTI, regime, forecast traces)"),
-        ("code", ANALYSIS_CODE),
+        ("code", safe_stage("ANALYSIS", ANALYSIS_CODE)),
 
         ("markdown", "## STAGE N — LaTeX tables (3 tables, paper-ready)"),
-        ("code", LATEX_TABLES_CODE),
+        ("code", safe_stage("LATEX_TABLES", LATEX_TABLES_CODE)),
 
         ("markdown", "## Final — Zip everything to /content/drive/MyDrive/ for download"),
         ("code", ZIP_DOWNLOAD_CODE),
