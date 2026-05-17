@@ -1367,8 +1367,10 @@ if not PRED_NPZ.exists():
     print(f"[WARN] {PRED_NPZ.name} not found — run STRATIFIED stage first.")
 else:
     npz = np.load(PRED_NPZ)
-    preds_solar = npz["preds"]   # (N, S)
-    truth = npz["truths"]        # (N,)
+    # Tolerate either naming scheme: CALIBRATION saved as y_true/y_samples
+    # in earlier runs; newer runs save under both. Accept either.
+    preds_solar = npz["preds"]    if "preds"  in npz.files else npz["y_samples"]
+    truth       = npz["truths"]   if "truths" in npz.files else npz["y_true"]
 
     # Build a persistence ensemble for fair comparison: GHI(t) + N(0, sigma_persistence)
     # sigma_persistence estimated from training residuals at h=60 steps (10min)
@@ -2410,7 +2412,9 @@ if not PRED_NPZ_E.exists():
     print(f"[WARN] {PRED_NPZ_E.name} not found — skipping economic stage.")
 else:
     npz = np.load(PRED_NPZ_E)
-    preds_solar = npz["preds"]; truth = npz["truths"]
+    # Tolerate either naming scheme (preds/truths or y_samples/y_true)
+    preds_solar = npz["preds"]  if "preds"  in npz.files else npz["y_samples"]
+    truth       = npz["truths"] if "truths" in npz.files else npz["y_true"]
 
     # Persistence ensemble (same as PIT stage)
     tr_ghi = data["train"]["ghi"]

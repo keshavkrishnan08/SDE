@@ -1767,6 +1767,20 @@ STAGE_C_OUT = RESULTS_DIR / "solar_sde_calibrated.csv"
 if STAGE_C_OUT.exists():
     print(f"[SKIP] Stage C already done: {STAGE_C_OUT}")
     df_cal = pd.read_csv(STAGE_C_OUT)
+    # One-shot upgrade: older runs wrote test_predictions_h10min.npz with
+    # only the {y_true, y_samples, is_ramp} schema. Downstream stages
+    # (PIT_RELIABILITY, BOOTSTRAP_CIS, ECONOMIC_CAISO) also accept the
+    # {preds, truths} schema. Re-save under both so both readers work.
+    _pred_npz = RESULTS_DIR / "test_predictions_h10min.npz"
+    if _pred_npz.exists():
+        _z = np.load(_pred_npz)
+        if "preds" not in _z.files or "truths" not in _z.files:
+            print(f"  [UPGRADE] adding preds/truths aliases to {_pred_npz.name}")
+            np.savez(_pred_npz,
+                     y_true=_z["y_true"], y_samples=_z["y_samples"],
+                     is_ramp=_z["is_ramp"],
+                     truths=_z["y_true"], preds=_z["y_samples"])
+        _z.close()
 else:
     print("=" * 70)
     print("STAGE C: Conformal calibration + per-point predictions for analysis")
@@ -1858,12 +1872,18 @@ else:
     print("\\nCalibrated results:")
     print(df_cal.to_string(index=False))
 
-    # Save per-point predictions for 10-min horizon (used in analysis)
+    # Save per-point predictions for 10-min horizon (used in analysis).
+    # Save under BOTH naming schemes:
+    #   y_true/y_samples/is_ramp   — STRATIFIED + ANALYSIS expect these
+    #   truths/preds               — PIT_RELIABILITY, BOOTSTRAP_CIS,
+    #                                ECONOMIC_CAISO expect these
     H_ANALYSIS = 60
     tf = test_f[H_ANALYSIS]
     np.savez(RESULTS_DIR / "test_predictions_h10min.npz",
-             y_true=tf["yt"], y_samples=tf["ys"], is_ramp=tf["ramp"])
-    print(f"\\nSaved per-point predictions to test_predictions_h10min.npz")
+             y_true=tf["yt"],   y_samples=tf["ys"], is_ramp=tf["ramp"],
+             truths=tf["yt"],   preds=tf["ys"])
+    print(f"\\nSaved per-point predictions to test_predictions_h10min.npz "
+          f"(keys: y_true/y_samples/is_ramp + preds/truths)")
 
     del sde, score; gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
