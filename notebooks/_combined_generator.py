@@ -1754,7 +1754,17 @@ else:
     abl = abl[[c for c in cols if c in abl.columns]]
     abl.to_csv(STAGE_B_OUT, index=False)
 
-    del sde_a2, sde_a5, lin; gc.collect()
+    # A4 uses `reg` (DeltaKtRegressor), not `lin` — the old name was stale.
+    # Guard each del so a missing local can't poison the gc step.
+    for _n in ("sde_a2", "sde_a5", "reg"):
+        if _n in dir(): pass   # noop; locals deleted below if present
+    try: del sde_a2
+    except NameError: pass
+    try: del sde_a5
+    except NameError: pass
+    try: del reg
+    except NameError: pass
+    gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     print("\\n" + "=" * 70); print("STAGE B COMPLETE")
