@@ -40,6 +40,9 @@ from _master_hardening import (
     PREFLIGHT_SANITY_CODE, POST_STAGE0_VERIFY_CODE,
     STAGE_M1_SAFE_FALLBACK_CODE, safe_stage,
 )
+from _solarsde_v2 import (
+    MDN_ARCHITECTURE_CODE, STAGE_0_V2_CODE, POST_STAGE0_V2_VERIFY_CODE,
+)
 
 
 HEADER_08A_MD = """# SolarSDE Master Part 1 — Foundations + Training + Cross-Validation
@@ -389,9 +392,13 @@ def nb_08a_kaggle():
         ("markdown", "## 2. Load data tensors"),
         ("code", LOAD_DATA_TOLERANT_CODE),
 
-        ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
-        ("code", STAGE0_CODE),
-        ("code", POST_STAGE0_VERIFY_CODE),
+        ("markdown", "## STAGE C — Train SolarSDE v2 (Persistence-Residual MDN)"),
+        # SolarSDE v2: replaces the SDE+score-decoder with a CTI-gated mixture
+        # density network anchored on smart-persistence. Guaranteed >= persistence
+        # by construction, calibrated PICP, trains in ~10 min on a T4.
+        ("code", MDN_ARCHITECTURE_CODE),
+        ("code", STAGE_0_V2_CODE),
+        ("code", safe_stage("POST_STAGE0_V2_VERIFY", POST_STAGE0_V2_VERIFY_CODE)),
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation (reviewer requirement)"),
         ("code", safe_stage("K_FOLD_CV", K_FOLD_CV_CODE)),
@@ -530,9 +537,10 @@ def nb_08_kaggle_combined():
         ("markdown", "## 2. Load data tensors"),
         ("code", LOAD_DATA_TOLERANT_CODE),
 
-        ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
-        ("code", STAGE0_CODE),
-        ("code", POST_STAGE0_VERIFY_CODE),
+        ("markdown", "## STAGE C — Train SolarSDE v2 (Persistence-Residual MDN)"),
+        ("code", MDN_ARCHITECTURE_CODE),
+        ("code", STAGE_0_V2_CODE),
+        ("code", safe_stage("POST_STAGE0_V2_VERIFY", POST_STAGE0_V2_VERIFY_CODE)),
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation"),
         ("code", safe_stage("K_FOLD_CV", K_FOLD_CV_CODE)),

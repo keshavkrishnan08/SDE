@@ -40,6 +40,9 @@ from _master_hardening import (
     PREFLIGHT_SANITY_CODE, STAGE_M1_SAFE_FALLBACK_CODE,
     POST_STAGE0_VERIFY_CODE, safe_stage,
 )
+from _solarsde_v2 import (
+    MDN_ARCHITECTURE_CODE, STAGE_0_V2_CODE, POST_STAGE0_V2_VERIFY_CODE,
+)
 from _generator import (
     CLOUDCV_DOWNLOAD, CLOUDCV_EXTRACT, BMS_DOWNLOAD, PREPROCESS_CODE,
     VAE_MODEL, IMAGE_DATASET, VAE_TRAIN, LATENT_EXTRACT,
@@ -635,9 +638,10 @@ def master_nb():
         ("markdown", "## 2. Load data tensors"),
         ("code", LOAD_DATA_TOLERANT_CODE),
 
-        ("markdown", "## STAGE C — Train SolarSDE on Golden (auto-resume)"),
-        ("code", STAGE0_CODE),
-        ("code", POST_STAGE0_VERIFY_CODE),
+        ("markdown", "## STAGE C — Train SolarSDE v2 (Persistence-Residual MDN)"),
+        ("code", MDN_ARCHITECTURE_CODE),
+        ("code", STAGE_0_V2_CODE),
+        ("code", safe_stage("POST_STAGE0_V2_VERIFY", POST_STAGE0_V2_VERIFY_CODE)),
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation (reviewer requirement)"),
         ("code", safe_stage("K_FOLD_CV", K_FOLD_CV_CODE)),
