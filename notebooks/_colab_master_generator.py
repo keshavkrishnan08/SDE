@@ -401,11 +401,23 @@ else:
                 kt0 = kt0.unsqueeze(1).repeat(1, N_SAMPLES, 1).reshape(-1, 1)
                 with torch.no_grad():
                     z = z0
+                    # Use the clamped em_step from SHARED_CODE (drift/sigma/z
+                    # bounded by Z_MEAN±8·Z_STD) — same path STAGE 0 inference
+                    # uses. Without clamping, long-horizon (h>=10min = 60+
+                    # Euler steps) rollouts drift OOD and PICP collapses.
                     for s in range(h):
-                        t = torch.full((bs * N_SAMPLES, 1), s / 180.0, device=DEVICE)
-                        z = z + sde_cv.drift(z, t, c0) + sde_cv.diffusion(z, cti0) * torch.randn_like(z)
+                        t_norm = torch.full((bs * N_SAMPLES, 1),
+                                            (s + 1) / 180.0, device=DEVICE)
+                        z = em_step(sde_cv.drift, sde_cv.diffusion,
+                                    z, t_norm, c0, cti0, 1.0)
                     kt_pred = score_cv.sample(z, cti0, c0, kt0, n=1).squeeze(-1).cpu().numpy()
                     kt_pred = kt_pred.reshape(bs, N_SAMPLES)
+                # Guard against any residual NaN/Inf so one bad batch can't
+                # poison the whole fold's metrics
+                if not np.isfinite(kt_pred).all():
+                    bad = (~np.isfinite(kt_pred)).sum()
+                    kt_pred = np.nan_to_num(kt_pred, nan=1.0, posinf=2.0, neginf=0.0)
+                    print(f"      [WARN] replaced {bad} non-finite kt samples in batch {i}")
                 ghi_pred = kt_pred * gcs_te_fold[i:end][:, None]
                 preds_l.append(ghi_pred); truths_l.append(ghi_te_fold[i + h:end + h])
             preds = np.concatenate(preds_l, axis=0); yt = np.concatenate(truths_l)
@@ -419,6 +431,10 @@ else:
             print(f"    h={HORIZON_MIN[h]:2d}min: CRPS={crps:.2f} RMSE={rmse:.2f} PICP={picp:.3f}")
         del sde_cv, score_cv, mh, dl, sds, sdl; gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
+        # Incremental save so a Kaggle session timeout mid-fold-5 doesn't
+        # lose folds 1-4. cv_results.csv is finalized after the loop.
+        pd.DataFrame(fold_rows).to_csv(
+            RESULTS_DIR / "cv_results_per_fold.csv", index=False)
 
     cv_df = pd.DataFrame(fold_rows)
     cv_df.to_csv(RESULTS_DIR / "cv_results_per_fold.csv", index=False)
