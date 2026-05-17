@@ -392,7 +392,7 @@ def nb_08a_kaggle():
         ("markdown", "## 2. Load data tensors"),
         ("code", LOAD_DATA_TOLERANT_CODE),
 
-        ("markdown", "## STAGE C — Train SolarSDE v2 (Persistence-Residual MDN)"),
+        ("markdown", "## STAGE C — Train Latent Neural SDE (Mixture-of-OU, closed-form marginals, CTI-gated diffusion)"),
         # SolarSDE v2: replaces the SDE+score-decoder with a CTI-gated mixture
         # density network anchored on smart-persistence. Guaranteed >= persistence
         # by construction, calibrated PICP, trains in ~10 min on a T4.
@@ -537,7 +537,7 @@ def nb_08_kaggle_combined():
         ("markdown", "## 2. Load data tensors"),
         ("code", LOAD_DATA_TOLERANT_CODE),
 
-        ("markdown", "## STAGE C — Train SolarSDE v2 (Persistence-Residual MDN)"),
+        ("markdown", "## STAGE C — Train Latent Neural SDE (Mixture-of-OU, closed-form marginals, CTI-gated diffusion)"),
         ("code", MDN_ARCHITECTURE_CODE),
         ("code", STAGE_0_V2_CODE),
         ("code", safe_stage("POST_STAGE0_V2_VERIFY", POST_STAGE0_V2_VERIFY_CODE)),
