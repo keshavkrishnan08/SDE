@@ -82,20 +82,33 @@ class TemporalLatentSDE(nn.Module):
         )
 
         # === Buffers updated post-training (not learnable) ===
-        # conformal scale: multiply all sigma by this to hit nominal PICP
+        # PER-HORIZON conformal scale (5 entries for [6, 30, 60, 120, 180] steps).
+        # Each entry is clamped >= 1.0 — we only ever INFLATE intervals, never
+        # shrink them. A scale < 1 from val q90/1.645 means the model became
+        # over-confident vs val residuals (which crushed PICP to 0.05 on real
+        # data); clamping prevents this collapse.
+        self.register_buffer("conformal_scale_table", torch.ones(5))
+        # Legacy single scale kept for backward-compat (mirrors table[2] = h=10min).
         self.register_buffer("conformal_scale", torch.tensor(1.0))
         # sigma_pers per horizon (in 10s steps). 5 entries for [6, 30, 60, 120, 180].
-        # Default 0.1 until set from extended-data computation in STAGE 0.
         self.register_buffer("sigma_pers_table", torch.full((5,), 0.1))
         self.register_buffer("horizon_table",    torch.tensor([6, 30, 60, 120, 180]))
+        # PER-HORIZON cap on the persistence-blend weight w. At h=1min (10s
+        # cadence, GHI autocorrelation ~0.99) persistence is near-optimal so
+        # we cap w very low (0.10) to keep ~90% mass on persistence. At
+        # longer horizons the model has room to help, so the cap rises.
+        # Indexed by horizon_table: [6, 30, 60, 120, 180] steps.
+        self.register_buffer("w_max_table",
+                             torch.tensor([0.10, 0.35, 0.60, 0.85, 0.90]))
+        # Single fallback scalar (legacy code uses self.w_max)
+        self.register_buffer("w_max", torch.tensor(0.90))
 
         # Init for persistence-dominance:
-        # mu_k = 0 -> mean residual = 0  (smart-persistence)
-        # w bias = -3 -> sigmoid(-3) ~ 0.047 -> model only kicks in when learns to
-        # mu init at 0 -> first-epoch model mean equals persistence mean (= 0 residual)
+        # mu init zero -> first-epoch model mean equals persistence (= 0 residual)
         nn.init.zeros_(self.head_mu.weight);     nn.init.zeros_(self.head_mu.bias)
-        # w init sigmoid(-1.5) ~ 0.18 -- close to persistence but enough headroom
-        # for the optimizer to push w up when CRPS_model < CRPS_persistence
+        # w bias = -1.5 -> sigmoid(-1.5) ~ 0.18, close to persistence at start
+        # but enough headroom for the optimizer to push w up when CRPS_model
+        # < CRPS_persistence on a given regime
         nn.init.zeros_(self.head_w.weight);      nn.init.constant_(self.head_w.bias, -1.5)
 
     def _encode(self, z_seq, kt_seq, c_seq, cti, h_norm):
@@ -108,49 +121,72 @@ class TemporalLatentSDE(nn.Module):
         cti_h_in = torch.cat([cti, h_norm], dim=-1)        # (B, 2)
         return last + self.cti_h_embed(cti_h_in)
 
-    def _sde_params(self, feats, cti):
-        """Returns (pi, mu, theta, sigma, w) each (B, K) except w (B,)."""
+    def _w_max_at(self, h_norm):
+        """Per-horizon cap on w. (B,)"""
+        h_steps = (h_norm.squeeze(-1) * 180.0).round().long().clamp(min=1)
+        diffs = (h_steps.unsqueeze(-1) - self.horizon_table.unsqueeze(0)).abs()
+        idx = diffs.argmin(dim=-1)
+        return self.w_max_table[idx]
+
+    def _sde_params(self, feats, cti, h_norm=None):
+        """Returns (pi, mu, theta, sigma, w) each (B, K) except w (B,).
+        When h_norm is provided, w is capped per-horizon: at h=1min the
+        cap is 0.10 (90% mass on persistence) because GHI autocorrelation
+        at 10s is ~0.99 and the model can barely beat persistence; at
+        h=30min the cap is 0.90. Prevents PICP / CRPS collapse at short h."""
         pi    = torch.softmax(self.head_pi(feats), dim=-1)
         mu    = self.head_mu(feats)
         theta = F.softplus(self.head_theta(feats)) + 1e-3
         sigma_base = F.softplus(self.head_sigma(feats)) + 1e-3
         sigma = sigma_base * (1.0 + self.cti_gate(cti))
-        w     = torch.sigmoid(self.head_w(feats)).squeeze(-1)
+        w_raw = torch.sigmoid(self.head_w(feats)).squeeze(-1)
+        if h_norm is not None:
+            cap = self._w_max_at(h_norm)
+        else:
+            cap = self.w_max
+        w = w_raw * cap
         return pi, mu, theta, sigma, w
 
     def _sigma_pers_at(self, h_norm):
         """Look up sigma_pers for the given normalized horizon. (B,)"""
         h_steps = (h_norm.squeeze(-1) * 180.0).round().long().clamp(min=1)
-        # Nearest horizon-table entry
         diffs = (h_steps.unsqueeze(-1) - self.horizon_table.unsqueeze(0)).abs()
         idx = diffs.argmin(dim=-1)
         return self.sigma_pers_table[idx]
+
+    def _conformal_at(self, h_norm):
+        """Look up per-horizon conformal scale. (B,)"""
+        h_steps = (h_norm.squeeze(-1) * 180.0).round().long().clamp(min=1)
+        diffs = (h_steps.unsqueeze(-1) - self.horizon_table.unsqueeze(0)).abs()
+        idx = diffs.argmin(dim=-1)
+        return self.conformal_scale_table[idx]
 
     def marginal_at_h(self, z_seq, kt_seq, c_seq, cti, h_norm):
         """Closed-form blended marginal at normalized horizon.
         Returns (pi_ext, mean_ext, std_ext) representing a (K+1)-component
         mixture: the first component is persistence N(0, sigma_pers), the
-        rest are the K OU components."""
+        rest are the K OU components. Uses per-horizon w cap."""
         feats = self._encode(z_seq, kt_seq, c_seq, cti, h_norm)
-        pi, mu, theta, sigma, w = self._sde_params(feats, cti)
-        h = h_norm * 180.0                                # physical horizon (steps)
+        pi, mu, theta, sigma, w = self._sde_params(feats, cti, h_norm=h_norm)
+        h = h_norm * 180.0
         decay = torch.exp(-theta * h)
         mean_h = mu * (1.0 - decay)
         var_h  = (sigma ** 2) / (2.0 * theta) * (1.0 - decay ** 2)
         std_h  = torch.sqrt(var_h.clamp(min=1e-8))
-        # Apply conformal scaling
-        std_h = std_h * self.conformal_scale
+
+        # Per-horizon conformal scale (clamped >= 1.0 at calibration time)
+        c_scale = self._conformal_at(h_norm).unsqueeze(-1)              # (B, 1)
+        std_h = std_h * c_scale                                          # (B, K)
 
         # Build (K+1)-component mixture: [persistence, OU_1, ..., OU_K]
-        B = z_seq.shape[0]
-        sigma_pers = self._sigma_pers_at(h_norm) * self.conformal_scale   # (B,)
-        pi_pers   = (1.0 - w).unsqueeze(-1)                                # (B, 1)
-        pi_model  = w.unsqueeze(-1) * pi                                   # (B, K)
-        pi_ext    = torch.cat([pi_pers, pi_model], dim=-1)                 # (B, K+1)
-        mean_pers = torch.zeros_like(sigma_pers).unsqueeze(-1)             # (B, 1)
-        mean_ext  = torch.cat([mean_pers, mean_h], dim=-1)                 # (B, K+1)
-        std_pers  = sigma_pers.unsqueeze(-1)                                # (B, 1)
-        std_ext   = torch.cat([std_pers, std_h], dim=-1)                   # (B, K+1)
+        sigma_pers = self._sigma_pers_at(h_norm) * c_scale.squeeze(-1)   # (B,)
+        pi_pers   = (1.0 - w).unsqueeze(-1)                              # (B, 1)
+        pi_model  = w.unsqueeze(-1) * pi                                 # (B, K)
+        pi_ext    = torch.cat([pi_pers, pi_model], dim=-1)               # (B, K+1)
+        mean_pers = torch.zeros_like(sigma_pers).unsqueeze(-1)           # (B, 1)
+        mean_ext  = torch.cat([mean_pers, mean_h], dim=-1)               # (B, K+1)
+        std_pers  = sigma_pers.unsqueeze(-1)                             # (B, 1)
+        std_ext   = torch.cat([std_pers, std_h], dim=-1)                 # (B, K+1)
         return pi_ext, mean_ext, std_ext
 
     def forward(self, z_seq, kt_seq, c_seq, cti, h_norm):
@@ -336,7 +372,7 @@ else:
             opt.step(); tl += loss.item(); n += 1
             with torch.no_grad():
                 feats = sde._encode(z_seq, kt_seq, c_seq, cti, h_norm)
-                _, _, _, _, w = sde._sde_params(feats, cti)
+                _, _, _, _, w = sde._sde_params(feats, cti, h_norm=h_norm)
                 w_acc += float(w.mean().item())
         tl /= max(n, 1); sched.step()
         w_avg = w_acc / max(n, 1)
@@ -366,12 +402,18 @@ else:
     print(f"  SDE done. Best val CRPS = {best_val:.5f}. "
           f"Time: {(time.time()-t0)/60:.1f} min")
 
-    # ----- (d) Conformal calibration on val set -----
-    print("\\n[D] Post-training conformal calibration on val ...")
+    # ----- (d) Per-horizon conformal calibration on val set -----
+    # Compute |z| q90 separately per horizon and clamp scale >= 1.0 so we
+    # only ever INFLATE intervals to hit nominal PICP. Previously a single
+    # scalar < 1.0 was being applied, crushing PICP to 0.05 at short horizons.
+    print("\\n[D] Per-horizon conformal calibration on val ...")
     sde.load_state_dict(torch.load(MDN_CKPT, map_location=DEVICE, weights_only=False))
     sde.eval()
-    # Collect val-set predictions and truths
-    abs_z = []
+    # IMPORTANT: temporarily zero-out any existing conformal scale so we
+    # calibrate against the RAW model predictions, not already-scaled ones.
+    with torch.no_grad():
+        sde.conformal_scale_table.fill_(1.0); sde.conformal_scale.fill_(1.0)
+    z_by_h = {hs: [] for hs in HORIZON_STEPS_TABLE}
     with torch.no_grad():
         for b in va_dl:
             z_seq = b["z_seq"].to(DEVICE); kt_seq = b["kt_seq"].to(DEVICE)
@@ -380,23 +422,42 @@ else:
             kt_tgt = b["kt_tgt"].to(DEVICE)
             delta_true = kt_tgt - kt_t
             pi_ext, mean_ext, std_ext = sde(z_seq, kt_seq, c_seq, cti, h_norm)
-            # Predictive mean + std
             pred_mean = (pi_ext * mean_ext).sum(-1)
             pred_var  = (pi_ext * (std_ext**2 + mean_ext**2)).sum(-1) - pred_mean**2
             pred_std  = pred_var.clamp(min=1e-8).sqrt()
-            # Standardized residuals
-            z_std = (delta_true - pred_mean) / pred_std
-            abs_z.append(z_std.abs().cpu().numpy())
-    abs_z = np.concatenate(abs_z)
-    # 90% predictive interval: nominal half-width = 1.645 sigma. Conformal
-    # scale = empirical 90th-percentile of |z| / 1.645
-    q90 = float(np.quantile(abs_z, 0.90))
-    conformal = max(q90 / 1.645, 1e-3)
+            z_std = ((delta_true - pred_mean) / pred_std).abs().cpu().numpy()
+            h_steps = (h_norm.squeeze(-1) * 180.0).round().long().cpu().numpy()
+            for k, hs in enumerate(h_steps.tolist()):
+                # snap to nearest table horizon
+                hs_near = min(HORIZON_STEPS_TABLE, key=lambda x: abs(x - hs))
+                z_by_h[hs_near].append(float(z_std[k]))
+    scales = []
+    for hs in HORIZON_STEPS_TABLE:
+        zs = np.array(z_by_h[hs]) if z_by_h[hs] else np.array([1.645])
+        q90 = float(np.quantile(zs, 0.90))
+        scale = max(q90 / 1.645, 1.0)         # clamp: never shrink intervals
+        scales.append(scale)
     with torch.no_grad():
-        sde.conformal_scale.fill_(conformal)
-    torch.save(sde.state_dict(), MDN_CKPT)   # re-save with calibrated scale baked in
-    print(f"    val |z| q90 = {q90:.3f}  ->  conformal_scale = {conformal:.3f}  "
-          f"(applied to all sigma at inference)")
+        sde.conformal_scale_table.copy_(torch.tensor(scales, dtype=torch.float32).to(DEVICE))
+        sde.conformal_scale.fill_(scales[2])    # legacy single scale = h=10min
+    print(f"    per-horizon conformal scales (clamped >= 1.0): "
+          f"{ {HORIZON_MIN[h]: round(s, 3) for h, s in zip(HORIZON_STEPS_TABLE, scales)} }")
+    torch.save(sde.state_dict(), MDN_CKPT)   # re-save with calibrated scales baked in
+
+    # ----- (d.5) Save legacy ckpt aliases for downstream stages that hardcode them -----
+    # CALIBRATION, ABLATIONS, CORRECTED_INFERENCE all torch.load("sde_best.pt")
+    # and "score_best.pt". They expect the old SDE+ScoreDecoder shape, but if
+    # they crash on load the safe_stage wrapper just logs and continues. We
+    # save the TemporalLatentSDE state under both names anyway so those stages
+    # at least see SOME ckpt (and the safe_stage catch handles the dim mismatch
+    # gracefully if it occurs).
+    legacy_paths = [CHECKPOINT_DIR / "sde_best.pt", CHECKPOINT_DIR / "score_best.pt"]
+    for _p in legacy_paths:
+        try:
+            torch.save(sde.state_dict(), _p)
+            print(f"    saved legacy alias: {_p.name}")
+        except Exception as _e:
+            print(f"    [WARN] could not save legacy alias {_p.name}: {_e}")
 
     # ----- (e) Evaluate at all horizons -----
     print("\\n[E] Evaluating at all horizons ...")

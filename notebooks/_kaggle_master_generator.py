@@ -43,6 +43,10 @@ from _master_hardening import (
 from _solarsde_v2 import (
     MDN_ARCHITECTURE_CODE, STAGE_0_V2_CODE, POST_STAGE0_V2_VERIFY_CODE,
 )
+from _multisite import (
+    DOWNLOAD_SURFRAD_CODE, DOWNLOAD_SKIPPD_CODE, DOWNLOAD_NSRDB_CODE,
+    MULTISITE_EVAL_CODE,
+)
 
 
 HEADER_08A_MD = """# SolarSDE Master Part 1 — Foundations + Training + Cross-Validation
@@ -403,6 +407,17 @@ def nb_08a_kaggle():
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation (reviewer requirement)"),
         ("code", safe_stage("K_FOLD_CV", K_FOLD_CV_CODE)),
 
+        ("markdown", "## STAGE MS — Multi-site validation (SURFRAD + SKIPP'D + NSRDB)"),
+        # Three independent datasets covering 7 climate zones (SURFRAD), a
+        # second sky-image site (SKIPP'D Stanford), and satellite-derived
+        # benchmarks (NSRDB). Kills reviewer #2's "only 5 days, one site"
+        # complaint. Each download wrapped in safe_stage so a network
+        # blip can't kill the whole notebook.
+        ("code", safe_stage("DOWNLOAD_SURFRAD", DOWNLOAD_SURFRAD_CODE)),
+        ("code", safe_stage("DOWNLOAD_SKIPPD",  DOWNLOAD_SKIPPD_CODE)),
+        ("code", safe_stage("DOWNLOAD_NSRDB",   DOWNLOAD_NSRDB_CODE)),
+        ("code", safe_stage("MULTISITE_EVAL",   MULTISITE_EVAL_CODE)),
+
         ("markdown", "## Final — Zip Part 1 outputs to /kaggle/working/"),
         ("code", ZIP_DOWNLOAD_CODE),
     ]
@@ -544,6 +559,12 @@ def nb_08_kaggle_combined():
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation"),
         ("code", safe_stage("K_FOLD_CV", K_FOLD_CV_CODE)),
+
+        ("markdown", "## STAGE MS — Multi-site validation (SURFRAD + SKIPP'D + NSRDB)"),
+        ("code", safe_stage("DOWNLOAD_SURFRAD", DOWNLOAD_SURFRAD_CODE)),
+        ("code", safe_stage("DOWNLOAD_SKIPPD",  DOWNLOAD_SKIPPD_CODE)),
+        ("code", safe_stage("DOWNLOAD_NSRDB",   DOWNLOAD_NSRDB_CODE)),
+        ("code", safe_stage("MULTISITE_EVAL",   MULTISITE_EVAL_CODE)),
 
         ("markdown", "## STAGE C+ — Corrected inference (advance time-deterministic covariates)"),
         ("code", safe_stage("CORRECTED_INFERENCE", CORRECTED_INFERENCE_CODE)),

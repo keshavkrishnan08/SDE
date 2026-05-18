@@ -43,6 +43,10 @@ from _master_hardening import (
 from _solarsde_v2 import (
     MDN_ARCHITECTURE_CODE, STAGE_0_V2_CODE, POST_STAGE0_V2_VERIFY_CODE,
 )
+from _multisite import (
+    DOWNLOAD_SURFRAD_CODE, DOWNLOAD_SKIPPD_CODE, DOWNLOAD_NSRDB_CODE,
+    MULTISITE_EVAL_CODE,
+)
 from _generator import (
     CLOUDCV_DOWNLOAD, CLOUDCV_EXTRACT, BMS_DOWNLOAD, PREPROCESS_CODE,
     VAE_MODEL, IMAGE_DATASET, VAE_TRAIN, LATENT_EXTRACT,
@@ -645,6 +649,12 @@ def master_nb():
 
         ("markdown", "## STAGE CV — Leave-one-day-out cross-validation (reviewer requirement)"),
         ("code", safe_stage("K_FOLD_CV", K_FOLD_CV_CODE)),
+
+        ("markdown", "## STAGE MS — Multi-site validation (SURFRAD + SKIPP'D + NSRDB)"),
+        ("code", safe_stage("DOWNLOAD_SURFRAD", DOWNLOAD_SURFRAD_CODE)),
+        ("code", safe_stage("DOWNLOAD_SKIPPD",  DOWNLOAD_SKIPPD_CODE)),
+        ("code", safe_stage("DOWNLOAD_NSRDB",   DOWNLOAD_NSRDB_CODE)),
+        ("code", safe_stage("MULTISITE_EVAL",   MULTISITE_EVAL_CODE)),
 
         ("markdown", "## STAGE C+ — Corrected inference (advance time-deterministic covariates)"),
         ("code", safe_stage("CORRECTED_INFERENCE", CORRECTED_INFERENCE_CODE)),
