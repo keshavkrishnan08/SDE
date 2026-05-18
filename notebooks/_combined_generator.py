@@ -902,12 +902,22 @@ else:
     import shutil
     shutil.rmtree(RAW_DIR, ignore_errors=True)
     print("Image features extracted. Raw images removed to free disk.")
-    print("NOTE: re-load `data` below to pick up new image features in covariates.")
-
-    # Reload data with image features included
-    data = {s: load_split(s) for s in ["train", "val", "test"]}
-    C_DIM = max(1, data["train"]["cov"].shape[1])
-    print(f"C_DIM updated to {C_DIM} (with image features)")
+    # NOTE: in the master notebooks, LOAD_DATA_TOLERANT_CODE runs immediately
+    # after this cell and (re)loads `data` with the new image_features.npy
+    # baked into the covariate stack. We only reload here if `load_split` is
+    # already in scope (legacy notebook ordering where LOAD_DATA preceded
+    # STAGE_MINUS1). Wrapped so a missing-name doesn't take down the cell.
+    if "load_split" in globals():
+        try:
+            data = {s: load_split(s) for s in ["train", "val", "test"]}
+            C_DIM = max(1, data["train"]["cov"].shape[1])
+            print(f"C_DIM updated to {C_DIM} (with image features)")
+        except Exception as _e:
+            print(f"  [INFO] in-stage reload skipped ({type(_e).__name__}); "
+                  f"LOAD_DATA will pick up the new image features next.")
+    else:
+        print("  [INFO] LOAD_DATA_TOLERANT_CODE runs next — it will load `data` "
+              "with the new image features. Skipping inline reload.")
 '''
 
 STAGE0_CODE = '''\
