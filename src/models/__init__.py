@@ -1,1 +1,0 @@
-"""SolarSDE model components."""
