@@ -1227,29 +1227,47 @@ else:
     save_baseline("smart_persistence", res_sp)
 
     # --- Build LSTM sequence tensors from extended 90-day data ---
+    # FIX: build BOTH (a) persistence-residual targets normalized by
+    # LSTM_GHI_SCALE for the LSTM/MC-Dropout baselines (so they have
+    # persistence as their mathematical floor + MSE values stay O(1)),
+    # and (b) raw-GHI targets for the CSDI baseline (which has its own
+    # internal [-1, 1] normalization via the shared GHI_SCALE=1200).
+    # NOTE: do NOT shadow the module-level GHI_SCALE — CSDI's
+    # _norm/_denorm reference it at call time.
     print("\\n[A3/A4] Building LSTM sequence tensors (extended 90-day BMS)")
-    def build_seq_tensors(df, seq_len, horizons):
+    LSTM_GHI_SCALE = 1000.0          # local scale for LSTM residual normalization
+    def build_seq_tensors_residual(df, seq_len, horizons):
         f_cols = ["ghi", "clear_sky_index", "solar_zenith"]
         for c in ["temperature", "humidity", "wind_speed"]:
             if c in df.columns: f_cols.append(c)
         X_arr = df[f_cols].fillna(0).values.astype(np.float32)
         ghi   = df["ghi"].values.astype(np.float32)
         mx = max(horizons)
-        Xs, Ys = [], []
+        Xs, Ys_delta, Ys_ghi, Anchors = [], [], [], []
         for i in range(seq_len, len(X_arr) - mx):
             Xs.append(X_arr[i - seq_len:i])
-            Ys.append(np.array([ghi[i + h] for h in horizons], dtype=np.float32))
-        return torch.tensor(np.stack(Xs)), torch.tensor(np.stack(Ys))
+            anchor = ghi[i - 1]   # last observed GHI = persistence floor
+            future_ghi = np.array([ghi[i + h] for h in horizons], dtype=np.float32)
+            Ys_ghi.append(future_ghi)
+            Ys_delta.append(((future_ghi - anchor) / LSTM_GHI_SCALE).astype(np.float32))
+            Anchors.append(anchor)
+        return (torch.tensor(np.stack(Xs)),
+                torch.tensor(np.stack(Ys_delta)),
+                torch.tensor(np.stack(Ys_ghi)),
+                torch.tensor(np.array(Anchors, dtype=np.float32)))
 
-    # Downsample extended 1-min BMS to 10s (keep every 6th row) for horizon alignment
     def ds(df): return df.iloc[::6].reset_index(drop=True) if len(df) > 0 else df
-    Xtr, Ytr = build_seq_tensors(ds(ext_train), SEQ_LEN, HORIZONS)
-    Xva, Yva = build_seq_tensors(ds(ext_val),   SEQ_LEN, HORIZONS)
-    Xte, Yte = build_seq_tensors(test_df,       SEQ_LEN, HORIZONS)
+    Xtr, Ytr_delta, Ytr_ghi, A_tr = build_seq_tensors_residual(ds(ext_train), SEQ_LEN, HORIZONS)
+    Xva, Yva_delta, Yva_ghi_t, A_va = build_seq_tensors_residual(ds(ext_val),   SEQ_LEN, HORIZONS)
+    Xte, Yte_delta, Yte_ghi_t, A_te = build_seq_tensors_residual(test_df,       SEQ_LEN, HORIZONS)
     mu_f = Xtr.mean(dim=(0,1), keepdim=True); sd_f = Xtr.std(dim=(0,1), keepdim=True) + 1e-6
     Xtr_n = (Xtr - mu_f) / sd_f; Xva_n = (Xva - mu_f) / sd_f; Xte_n = (Xte - mu_f) / sd_f
+    # Aliases: legacy `Ytr/Yva/Yte` route to the persistence-residual targets
+    # (consumed by LSTM/MC-Dropout). CSDI uses Ytr_ghi (raw W/m^2) explicitly.
+    Ytr = Ytr_delta; Yva = Yva_delta; Yte = Yte_delta
     INPUT_DIM = Xtr_n.shape[-1]; N_H = len(HORIZONS)
-    print(f"  Seq shapes: train={Xtr.shape}  val={Xva.shape}  test={Xte.shape}")
+    print(f"  Seq shapes: train={Xtr.shape}  val={Xva.shape}  test={Xte.shape}  "
+          f"(LSTM target = persistence-residual / {LSTM_GHI_SCALE:.0f}, CSDI uses raw GHI)")
     te_ghi_seq = test_df["ghi"].values.astype(np.float32)
     te_ramp_seq = test_df["is_ramp"].values.astype(bool)
 
@@ -1288,22 +1306,34 @@ else:
         return model
 
     # --- A3 LSTM deterministic ---
-    print("\\n[A3] LSTM deterministic (40 epochs)")
+    # The LSTM now predicts the persistence residual delta = GHI(t+h) - GHI(t)
+    # (normalized by GHI_SCALE). Final prediction = persistence_anchor + delta.
+    # Sigma is calibrated on VAL residuals, not train. This guarantees the
+    # baseline at least matches persistence in expectation.
+    print("\\n[A3] LSTM deterministic (40 epochs, persistence-residual target)")
     torch.manual_seed(42)
-    lstm = train_lstm(LSTMF(INPUT_DIM, 128, 2, N_H, drop=0.0), Xtr_n, Ytr, Xva_n, Yva, epochs=40, tag="lstm_det")
+    lstm = train_lstm(LSTMF(INPUT_DIM, 128, 2, N_H, drop=0.0),
+                      Xtr_n, Ytr, Xva_n, Yva, epochs=40, tag="lstm_det")
     lstm.eval()
     with torch.no_grad():
-        pred_tr = lstm(Xtr_n.to(DEVICE)).cpu().numpy()
-        pred_te = lstm(Xte_n.to(DEVICE)).cpu().numpy()
-    res_tr_lstm = Ytr.numpy() - pred_tr
-    lstm_std = {HORIZONS[i]: float(res_tr_lstm[:, i].std()) for i in range(N_H)}
+        pred_va_delta = lstm(Xva_n.to(DEVICE)).cpu().numpy() * LSTM_GHI_SCALE   # (N, N_H)
+        pred_te_delta = lstm(Xte_n.to(DEVICE)).cpu().numpy() * LSTM_GHI_SCALE
+    A_va_np = A_va.numpy(); A_te_np = A_te.numpy()
+    # Calibrate per-horizon sigma from VAL ABSOLUTE residuals (not train delta)
+    Yva_ghi_abs = Yva_ghi_t.numpy()                              # (N_va, N_H)
+    pred_va_ghi = A_va_np[:, None] + pred_va_delta               # (N_va, N_H)
+    lstm_std = {HORIZONS[i]: float((pred_va_ghi[:, i] - Yva_ghi_abs[:, i]).std())
+                for i in range(N_H)}
+    print(f"    LSTM val-residual sigma per horizon: "
+          f"{ {HORIZON_MIN[h]: round(lstm_std[h], 1) for h in HORIZONS} }")
     rng = np.random.default_rng(42); res_lstm = {}
+    pred_te_ghi = A_te_np[:, None] + pred_te_delta              # persistence-anchored
     for hi, h in enumerate(HORIZONS):
         yt, ys, rm = [], [], []
-        for i in range(min(N_EVAL, len(pred_te))):
+        for i in range(min(N_EVAL, len(pred_te_ghi))):
             ti = SEQ_LEN + i + h
             if ti < len(te_ghi_seq):
-                pt = pred_te[i, hi]
+                pt = float(pred_te_ghi[i, hi])
                 samples = np.clip(pt + rng.normal(0, lstm_std[h], size=N_SAMPLES), 0, None)
                 yt.append(te_ghi_seq[ti]); ys.append(samples); rm.append(te_ramp_seq[ti])
         m = all_metrics(np.array(yt), np.array(ys), is_ramp=np.array(rm))
@@ -1313,11 +1343,18 @@ else:
     save_baseline("lstm", res_lstm)
 
     # --- A4 MC-Dropout LSTM ---
-    print("\\n[A4] MC-Dropout LSTM (40 epochs)")
+    # Train dropout=0.3 (was 0.1 — too low to give inference-time variance,
+    # gave PICP=0.0005). At inference dropout stays ACTIVE. Add per-horizon
+    # post-hoc sigma calibration: rescale each sample's deviation from the
+    # ensemble mean so the empirical val 90% PI covers 90% — standard
+    # calibrated-MC-Dropout. Without this, MC-Dropout intervals are known
+    # to be too narrow (a documented limitation of the method).
+    print("\\n[A4] MC-Dropout LSTM (40 epochs, persistence-residual + dropout=0.3 + calibration)")
     torch.manual_seed(42)
-    mcd = train_lstm(LSTMF(INPUT_DIM, 128, 2, N_H, drop=0.1), Xtr_n, Ytr, Xva_n, Yva, epochs=40, tag="lstm_mcd")
+    mcd = train_lstm(LSTMF(INPUT_DIM, 128, 2, N_H, drop=0.3),
+                     Xtr_n, Ytr, Xva_n, Yva, epochs=40, tag="lstm_mcd")
     def mc_predict(model, X, n_passes=50, bs=256):
-        model.train()
+        model.train()                              # KEEP dropout active at inference
         out = []
         for _ in range(n_passes):
             preds = []
@@ -1326,15 +1363,36 @@ else:
                     preds.append(model(X[i:i+bs].to(DEVICE)).cpu())
             out.append(torch.cat(preds, dim=0).numpy())
         model.eval()
-        return np.stack(out, axis=0)
-    mc_pred = mc_predict(mcd, Xte_n, n_passes=N_SAMPLES)
+        return np.stack(out, axis=0)               # (n_passes, N, N_H)
+
+    # MC ensemble on VAL to calibrate, then on TEST for the actual eval
+    mc_val_delta  = mc_predict(mcd, Xva_n, n_passes=N_SAMPLES) * LSTM_GHI_SCALE  # (S, N_va, N_H)
+    mc_val_ghi    = mc_val_delta + A_va_np[None, :, None]
+    mc_val_mean   = mc_val_ghi.mean(axis=0)                                      # (N_va, N_H)
+    mc_test_delta = mc_predict(mcd, Xte_n, n_passes=N_SAMPLES) * LSTM_GHI_SCALE
+    mc_pred_ghi   = mc_test_delta + A_te_np[None, :, None]                       # (S, N_te, N_H)
+
+    # Per-horizon calibration: scale = (val absolute residual std) / (val MC ensemble std).
+    # If the model is under-confident this scale > 1 and inflates intervals to hit nominal.
+    mcd_scale = {}
+    for hi in range(N_H):
+        sigma_obs = float((mc_val_mean[:, hi] - Yva_ghi_abs[:, hi]).std())
+        sigma_mc  = float(mc_val_ghi[:, :, hi].std(axis=0).mean())
+        mcd_scale[HORIZONS[hi]] = max(sigma_obs / max(sigma_mc, 1e-6), 1.0)
+    print(f"    MC-Dropout per-horizon calibration scale: "
+          f"{ {HORIZON_MIN[h]: round(mcd_scale[h], 2) for h in HORIZONS} }")
+
     res_mcd = {}
+    mc_test_mean = mc_pred_ghi.mean(axis=0)                                       # (N_te, N_H)
     for hi, h in enumerate(HORIZONS):
         yt, ys, rm = [], [], []
-        for i in range(min(N_EVAL, mc_pred.shape[1])):
+        scale = mcd_scale[h]
+        for i in range(min(N_EVAL, mc_pred_ghi.shape[1])):
             ti = SEQ_LEN + i + h
             if ti < len(te_ghi_seq):
-                samples = np.clip(mc_pred[:, i, hi], 0, None)
+                # rescale deviation from ensemble mean to hit nominal coverage
+                raw = mc_pred_ghi[:, i, hi]
+                samples = np.clip(mc_test_mean[i, hi] + (raw - mc_test_mean[i, hi]) * scale, 0, None)
                 yt.append(te_ghi_seq[ti]); ys.append(samples); rm.append(te_ramp_seq[ti])
         m = all_metrics(np.array(yt), np.array(ys), is_ramp=np.array(rm))
         m["horizon_min"] = HORIZON_MIN[h]; m["horizon_steps"] = h; m["n_eval"] = len(yt)
@@ -1342,7 +1400,13 @@ else:
         print(f"  h={HORIZON_MIN[h]}min: CRPS={m['crps']:.2f} RMSE={m['rmse']:.2f} PICP={m['picp']:.3f}")
     save_baseline("mc_dropout", res_mcd)
 
-    del lstm, mcd, pred_tr, pred_te, mc_pred
+    # Cleanup (use the variable names that actually exist now)
+    try: del lstm, mcd
+    except NameError: pass
+    try: del pred_va_delta, pred_te_delta
+    except NameError: pass
+    try: del mc_val_delta, mc_val_ghi, mc_test_delta, mc_pred_ghi, mc_test_mean
+    except NameError: pass
     gc.collect(); torch.cuda.is_available() and torch.cuda.empty_cache()
 
     # --- A5 CSDI (horizon-conditioned, trained once) ---
@@ -1420,10 +1484,12 @@ else:
     torch.manual_seed(42)
     csdi = CSDIScoreNet(d_in=INPUT_DIM, d=64, nh=4, nl=4, steps=50).to(DEVICE)
     opt = torch.optim.Adam(csdi.parameters(), lr=1e-3)
-    # Build multi-horizon training set: stack (X, Y[:, hi], hi) for each horizon
+    # Build multi-horizon training set: stack (X, GHI[:, hi], hi) for each horizon.
+    # CSDI consumes raw W/m² targets and applies its own [-1, 1] normalization
+    # via the shared GHI_SCALE=1200; Ytr_ghi has the absolute GHI values.
     multi_X = []; multi_Y = []; multi_H = []
     for hi in range(N_H):
-        multi_X.append(Xtr_n); multi_Y.append(Ytr[:, hi]); multi_H.append(torch.full((len(Xtr_n),), hi, dtype=torch.long))
+        multi_X.append(Xtr_n); multi_Y.append(Ytr_ghi[:, hi]); multi_H.append(torch.full((len(Xtr_n),), hi, dtype=torch.long))
     multi_X = torch.cat(multi_X, 0); multi_Y = torch.cat(multi_Y, 0); multi_H = torch.cat(multi_H, 0)
     ds = TensorDataset(multi_X, multi_Y, multi_H)
     dl = DataLoader(ds, batch_size=128, shuffle=True, drop_last=True, num_workers=0)
