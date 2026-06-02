@@ -520,6 +520,25 @@ def load_split(s):
         "gcs":  np.load(LATENT_DIR / f"{s}_ghi_clearsky.npy"),
     }
 data = {s: load_split(s) for s in ["train", "val", "test"]}
+
+# CTI NORMALIZATION. Raw CTI = ||Var(latent velocity)||_2 lands around 1e-4, far
+# too compressed for the model's CTI-conditional diffusion gate / persistence
+# widening to respond — so the model could not tell a stormy minute from a calm
+# one, and coverage collapsed on turbulent days (CV folds showed PICP 0.42-0.92
+# day-to-day). We rescale by a robust TRAIN statistic (90th pct) so turbulent
+# periods reach O(1+) magnitude while staying non-negative (CTI is a magnitude;
+# the persistence-widening multiplier 1 + cti*softplus(alpha) must not flip sign).
+# Monotonic + non-negative => CTI quartile stratification and Spearman analyses
+# are unchanged. Same transform applied to every split (no leakage).
+_cti_p90 = float(np.percentile(data["train"]["cti"].astype(np.float64), 90))
+_cti_scale = _cti_p90 if _cti_p90 > 1e-12 else (float(data["train"]["cti"].std()) or 1.0)
+for _s in data:
+    data[_s]["cti_raw"] = data[_s]["cti"].copy()
+    data[_s]["cti"] = np.clip(data[_s]["cti"].astype(np.float32) / _cti_scale, 0.0, 10.0).astype(np.float32)
+print(f"  CTI normalized: /{_cti_scale:.2e} (train p90) -> "
+      f"train mean={data['train']['cti'].mean():.3f} p90={np.percentile(data['train']['cti'],90):.3f} "
+      f"max={data['train']['cti'].max():.2f}")
+
 print(f"\\n  Covariate dim: {data['train']['cov'].shape[1]}  "
       f"(5 original + 15 physics + "
       f"{data['train']['cov'].shape[1] - 20} image features)")
@@ -1721,16 +1740,21 @@ if cti_windows:
 CORRECTED_INFERENCE_CODE = '''\
 # ==== Corrected inference: advance time-deterministic covariates per rollout step ====
 # ML PhD audit finding: the original STAGE 0 eval holds covariates at t=0 for the
-# entire h-step rollout. Solar zenith and clear-sky-related features change
-# substantially over 30 minutes, especially near sunrise/sunset. This biases
-# the SDE drift at long horizons.
+# entire h-step rollout. Solar geometry and clear-sky features change substantially
+# over 30 minutes near sunrise/sunset, biasing the drift at long horizons.
 #
-# Fix: at rollout step s, take solar geometry + time features from t+s while
-# keeping lagged trend features (kt_trend_*, ghi_std_*) and meteorology
-# (temperature, humidity, wind) frozen at t (since these aren't known-in-advance).
-#
-# Also saves per-horizon SolarSDE predictions to PREDS_DIR so the bootstrap CI
-# stage can evaluate all horizons (not just h=10min).
+# v2 guard: STAGE 0 v2 evaluates closed-form OU marginals at each horizon directly
+# (no autoregressive rollout), so future-covariate advancement is moot. The
+# legacy LatentNeuralSDE block below also crashes on the v2 state dict. Skip.
+if (CHECKPOINT_DIR / "mdn_v2_best.pt").exists():
+    # Mirror main results to corrected so bootstrap / PIT have a file to read.
+    _co = RESULTS_DIR / "solar_sde_main_corrected_results.csv"
+    _mr = RESULTS_DIR / "solar_sde_main_results.csv"
+    if (not _co.exists()) and _mr.exists():
+        pd.read_csv(_mr).to_csv(_co, index=False)
+        print(f"    [INFO] mirrored solar_sde_main_results.csv -> {_co.name}")
+    raise _StageSkip("v2 model detected — corrected inference unnecessary "
+                     "(closed-form OU marginals avoid rollout drift)")
 ADVANCE_IDX = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 ADVANCE_MASK = np.zeros(C_DIM, dtype=bool)
 for i in ADVANCE_IDX:

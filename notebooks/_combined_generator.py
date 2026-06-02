@@ -454,6 +454,21 @@ def pinaw_metric(y_samples, y_range, alpha=0.9):
     hi = np.quantile(y_samples, 1 - (1 - alpha) / 2, axis=1)
     return float((hi - lo).mean() / max(y_range, 1e-9))
 
+def winkler_score(y_true, y_samples, alpha=0.9):
+    """Winkler / interval score for the central (1-... ) PI. Lower = better.
+    For a (alpha) PI [lo, hi] with miscoverage m=1-alpha:
+      W = (hi-lo) + (2/m)(lo-y) if y<lo ; + (2/m)(y-hi) if y>hi ; else (hi-lo).
+    Reported as the mean over points. SkyGPT reports this (their value 26.70).
+    Note: match alpha to the compared paper's PI level for a like-for-like number."""
+    m = 1.0 - alpha
+    lo = np.quantile(y_samples, m / 2, axis=1)
+    hi = np.quantile(y_samples, 1 - m / 2, axis=1)
+    width = hi - lo
+    below = y_true < lo
+    above = y_true > hi
+    w = width + below * (2.0 / m) * (lo - y_true) + above * (2.0 / m) * (y_true - hi)
+    return float(np.mean(w))
+
 def all_metrics(y_true, y_samples, is_ramp=None, alpha=0.9):
     if len(y_true) == 0: return {"crps": 0, "picp": 0, "pinaw": 0, "rmse": 0, "mae": 0, "ramp_crps": 0}
     y_med = np.median(y_samples, axis=1)
@@ -1245,11 +1260,24 @@ else:
     # NOTE: do NOT shadow the module-level GHI_SCALE — CSDI's
     # _norm/_denorm reference it at call time.
     print("\\n[A3/A4] Building LSTM sequence tensors (extended 90-day BMS)")
-    LSTM_GHI_SCALE = 1000.0          # local scale for LSTM residual normalization
+    # ADAPTIVE SCALE: the targets are GHI (W/m^2, ~0-1200) on CloudCV but PV power
+    # (kW, ~0-30) on SKIPP'D. A fixed 1000/1200 scale underflows PV residuals to
+    # ~0 -> LSTM loss collapses to 0 -> NaN in calibration -> torch.multinomial
+    # device-side assert that poisons the whole CUDA context. Derive both scales
+    # from the actual target range so LSTM/MC-Dropout/CSDI are well-conditioned
+    # on either dataset.
+    _tgt_max = float(np.nanmax(data["train"]["ghi"])) if len(data["train"]["ghi"]) else 1200.0
+    GHI_SCALE = max(_tgt_max * 1.2, 1.0)           # re-bind module global used by CSDI _norm/_denorm
+    LSTM_GHI_SCALE = GHI_SCALE                      # LSTM residual normalization scale
+    print(f"    target scale set to {GHI_SCALE:.1f} (from train max {_tgt_max:.1f}) "
+          f"— PV-aware, prevents residual underflow")
     def build_seq_tensors_residual(df, seq_len, horizons):
-        f_cols = ["ghi", "clear_sky_index", "solar_zenith"]
-        for c in ["temperature", "humidity", "wind_speed"]:
-            if c in df.columns: f_cols.append(c)
+        # Use whatever feature columns exist. ghi + clear_sky_index are always
+        # present; meteorological/solar covariates exist only for CloudCV-style
+        # extended data, not SKIPP'D (which is PV-only) — so they're optional.
+        f_cols = [c for c in ["ghi", "clear_sky_index", "solar_zenith",
+                              "temperature", "humidity", "wind_speed"]
+                  if c in df.columns]
         X_arr = df[f_cols].fillna(0).values.astype(np.float32)
         ghi   = df["ghi"].values.astype(np.float32)
         mx = max(horizons)
@@ -1565,7 +1593,13 @@ else:
 ABLATIONS_CODE = '''\
 # ==== STAGE B: Ablations ====
 STAGE_B_OUT = RESULTS_DIR / "ablation_results.csv"
-if STAGE_B_OUT.exists():
+# v2 guard: when mdn_v2_best.pt is present, the legacy LatentNeuralSDE class
+# cannot load it (different state-dict shape). ABLATIONS_V2_CODE handles
+# ablations for the v2 architecture; this legacy block is a no-op in v2.
+if (CHECKPOINT_DIR / "mdn_v2_best.pt").exists():
+    print("[SKIP] v2 model detected (mdn_v2_best.pt) — legacy ABLATIONS skipped; "
+          "use ABLATIONS_V2 stage instead.")
+elif STAGE_B_OUT.exists():
     print(f"[SKIP] Stage B already done: {STAGE_B_OUT}")
     abl = pd.read_csv(STAGE_B_OUT)
 else:
@@ -1850,7 +1884,23 @@ else:
 CALIBRATION_CODE = '''\
 # ==== STAGE C: Post-hoc Conformal Calibration + Analysis ====
 STAGE_C_OUT = RESULTS_DIR / "solar_sde_calibrated.csv"
-if STAGE_C_OUT.exists():
+# v2 guard: the v2 STAGE 0 does per-(horizon, CTI-quartile) conformal
+# calibration inline. Legacy CALIBRATION_CODE expects the old LatentNeuralSDE
+# state dict and crashes on load. Skip cleanly when v2 ckpt is present.
+if (CHECKPOINT_DIR / "mdn_v2_best.pt").exists():
+    print("[SKIP] v2 model detected — calibration is built into STAGE 0 v2 "
+          "(per-(horizon, CTI-quartile) conformal scales baked into mdn_v2_best.pt).")
+    # Surface a tiny df so downstream consumers that read solar_sde_calibrated.csv
+    # don't crash. They'll fall back to solar_sde_main_results.csv anyway.
+    if not STAGE_C_OUT.exists():
+        try:
+            _main = pd.read_csv(RESULTS_DIR / "solar_sde_main_results.csv")
+            _main.to_csv(STAGE_C_OUT, index=False)
+            print(f"    [INFO] copied solar_sde_main_results.csv -> {STAGE_C_OUT.name}")
+        except Exception as _e:
+            print(f"    [WARN] could not seed {STAGE_C_OUT.name}: {_e}")
+    df_cal = pd.read_csv(STAGE_C_OUT) if STAGE_C_OUT.exists() else pd.DataFrame()
+elif STAGE_C_OUT.exists():
     print(f"[SKIP] Stage C already done: {STAGE_C_OUT}")
     df_cal = pd.read_csv(STAGE_C_OUT)
     # One-shot upgrade: older runs wrote test_predictions_h10min.npz with

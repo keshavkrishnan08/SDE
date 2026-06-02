@@ -66,3 +66,8 @@ wandb/
 *.bak
 *.old
 tool-results/
+
+# Local benchmark data (notebooks re-download: SKIPP'D from HuggingFace, SkyGPT test from Google Drive)
+data/skippd/
+data/skygpt/
+data/surfrad/

@@ -42,6 +42,7 @@ from _master_hardening import (
 )
 from _solarsde_v2 import (
     MDN_ARCHITECTURE_CODE, STAGE_0_V2_CODE, POST_STAGE0_V2_VERIFY_CODE,
+    ABLATIONS_V2_CODE,
 )
 from _multisite import (
     DOWNLOAD_SURFRAD_CODE, DOWNLOAD_SKIPPD_CODE, DOWNLOAD_NSRDB_CODE,
@@ -448,7 +449,8 @@ def nb_08b_kaggle():
         ("markdown", "## STAGE D — Standard baselines (persistence, smart-pers, LSTM, MC-Dropout, CSDI)"),
         ("code", safe_stage("BASELINES", BASELINES_CODE)),
 
-        ("markdown", "## STAGE F — Ablations A2 (no-CTI), A4 (no-score), A5 (no-SDE/ODE), A3 (no-VAE PCA)"),
+        ("markdown", "## STAGE F — Ablations: v2-native (A2 no-CTI, A4 no-persistence, A5 no-SDE, A7 no-cov)"),
+        ("code", safe_stage("ABLATIONS_V2", ABLATIONS_V2_CODE)),
         ("code", safe_stage("ABLATIONS", ABLATIONS_CODE)),
         ("code", safe_stage("EXTRA_ABLATIONS", EXTRA_ABLATIONS_CODE)),
 

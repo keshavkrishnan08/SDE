@@ -14,11 +14,18 @@ def safe_stage(name: str, code: str) -> str:
     single bug doesn't take down the entire 08b run."""
     # Indent every line of `code` by 4 spaces so it sits inside `try:`.
     indented = "\n".join(("    " + ln if ln else "") for ln in code.splitlines())
+    # _StageSkip: a sentinel a stage can raise to indicate "clean skip, not
+    # failure" — e.g. a v2 model is present and the legacy code path doesn't
+    # apply. Caught BEFORE the generic Exception handler so the SKIP prints
+    # without a traceback or `[STAGE FAILED]` banner.
     return (
         f"# ==== SAFE STAGE: {name} ====\n"
         f"import traceback as _tb_safe_stage\n"
+        f"class _StageSkip(Exception): pass\n"
         f"try:\n"
         f"{indented}\n"
+        f"except _StageSkip as _e_skip:\n"
+        f"    print(f'[SKIP] {name}: {{_e_skip}}')\n"
         f"except Exception as _e_safe_stage:\n"
         f"    print('\\n' + '!' * 70)\n"
         f"    print(f'[STAGE FAILED] {name}: "
