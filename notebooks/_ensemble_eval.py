@@ -140,11 +140,25 @@ if have_ro:
     yt, ys_ro = _val_samples(m_ro, h_sel_steps)
     variants["rollout"] = float(crps_empirical(yt, ys_ro).mean())
     del m_ro; gc.collect()
+ENS_W = 0.5
 if have_cf and have_ro:
-    # Ensemble: pool half the samples from each model (equal-weight mixture).
-    n_half = ys_cf.shape[1] // 2
-    ys_ens = np.concatenate([ys_cf[:, :n_half], ys_ro[:, :n_half]], axis=1)
-    variants["ensemble"] = float(crps_empirical(yt, ys_ens).mean())
+    # WEIGHT-OPTIMIZED ensemble: a fixed 50/50 mix is suboptimal when one model
+    # is stronger. We search the mixing weight w (fraction of samples drawn from
+    # the closed-form model) that MINIMIZES val CRPS at the selection horizon,
+    # then use that weight everywhere. w=1 recovers closed-form, w=0 recovers
+    # rollout — so the ensemble can never be worse than the better single model.
+    M = ys_cf.shape[1]
+    _best_w, _best_c = 0.5, 1e9
+    for w in np.linspace(0.0, 1.0, 11):
+        ncf = int(round(w * M)); nro = M - ncf
+        if ncf == 0: ys_e = ys_ro
+        elif nro == 0: ys_e = ys_cf
+        else: ys_e = np.concatenate([ys_cf[:, :ncf], ys_ro[:, :nro]], axis=1)
+        c = float(crps_empirical(yt, ys_e).mean())
+        if c < _best_c: _best_c, _best_w = c, float(w)
+    ENS_W = _best_w
+    variants["ensemble"] = _best_c
+    print(f"  ensemble weight optimized on val: w(closed-form)={ENS_W:.2f}")
 if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 for k, v in sorted(variants.items(), key=lambda t: t[1]):
@@ -182,7 +196,9 @@ if _src_pred.exists():
 # (ablations, sampling, compute) instantiate the right model.
 TemporalLatentSDE = ClosedFormSDE if _best_single == "closedform" else RolloutLatentSDE
 CHAMPION_SINGLE = _best_single
+ENSEMBLE_W = ENS_W            # val-optimized closed-form weight, used by the SkyGPT benchmark
 print(f"  downstream suite runs on: {_best_single} (canonical mdn_v2_best.pt restored)")
+print(f"  ensemble weight for benchmark: w(closed-form)={ENSEMBLE_W:.2f}")
 '''
 
 
@@ -332,9 +348,14 @@ for h in SKY_H:
     sp_crps = float(crps_empirical(yt, sp).mean())
     samp_full = {k: np.concatenate(v) for k, v in samp_by_variant.items()}
     if len(samp_full) == 2:
-        nh = N_SAMPLES // 2
-        samp_full["ensemble"] = np.concatenate(
-            [samp_full["closedform"][:, :nh], samp_full["rollout"][:, :nh]], axis=1)
+        # use the val-optimized mixing weight (falls back to 0.5 if not set)
+        _w = float(globals().get("ENSEMBLE_W", 0.5))
+        ncf = int(round(_w * N_SAMPLES)); nro = N_SAMPLES - ncf
+        if ncf == 0: samp_full["ensemble"] = samp_full["rollout"]
+        elif nro == 0: samp_full["ensemble"] = samp_full["closedform"]
+        else:
+            samp_full["ensemble"] = np.concatenate(
+                [samp_full["closedform"][:, :ncf], samp_full["rollout"][:, :nro]], axis=1)
     for name, ys in samp_full.items():
         crps = float(crps_empirical(yt, ys).mean())
         wink = winkler_score(yt, ys, 0.9); picp = picp_metric(yt, ys, 0.9)

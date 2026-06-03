@@ -1473,7 +1473,11 @@ else:
         def __init__(self, d_in, d=64, nh=4, nl=4, steps=100):
             super().__init__()
             self.steps = steps
-            self.demb = DiffEmb(d); self.hemb = nn.Embedding(5, d)
+            # Horizon embedding sized to the actual horizon count (was hardcoded
+            # 5; SKIPP'D adds h=15 -> 6 horizons, so index 5 went out of bounds
+            # and triggered a device-side assert that surfaced as a CUBLAS crash
+            # and poisoned the whole CUDA context).
+            self.demb = DiffEmb(d); self.hemb = nn.Embedding(len(HORIZONS), d)
             self.proj = nn.Linear(d_in + 1, d); self.dproj = nn.Linear(d, d)
             self.blocks = nn.ModuleList([TxBlock(d, nh) for _ in range(nl)])
             self.out = nn.Linear(d, 1)
@@ -2301,7 +2305,16 @@ else:
     print("\\n[D3] Generating figures")
 
     # Fig 2: CRPS vs horizon
-    combined = pd.read_csv(RESULTS_DIR / "main_results_combined.csv")
+    # Tolerant load: if the baseline stage didn't run/failed, fall back to the
+    # SolarSDE-only results so figures/analysis still render.
+    _comb_p = RESULTS_DIR / "main_results_combined.csv"
+    if _comb_p.exists():
+        combined = pd.read_csv(_comb_p)
+    else:
+        print("    [WARN] main_results_combined.csv missing (baselines skipped) — "
+              "using SolarSDE results only")
+        combined = pd.read_csv(RESULTS_DIR / "solar_sde_main_results.csv")
+        if "model" not in combined.columns: combined["model"] = "SolarSDE"
     fig, ax = plt.subplots(figsize=(8, 5))
     style = {"SolarSDE": ("#e74c3c", 2.5), "persistence": ("#95a5a6", 1.0),
              "smart_persistence": ("#7f8c8d", 1.0), "lstm": ("#3498db", 1.5),
@@ -2371,7 +2384,16 @@ else:
 
 # ==== Final paper tables ====
 try:
-    combined = pd.read_csv(RESULTS_DIR / "main_results_combined.csv")
+    # Tolerant load: if the baseline stage didn't run/failed, fall back to the
+    # SolarSDE-only results so figures/analysis still render.
+    _comb_p = RESULTS_DIR / "main_results_combined.csv"
+    if _comb_p.exists():
+        combined = pd.read_csv(_comb_p)
+    else:
+        print("    [WARN] main_results_combined.csv missing (baselines skipped) — "
+              "using SolarSDE results only")
+        combined = pd.read_csv(RESULTS_DIR / "solar_sde_main_results.csv")
+        if "model" not in combined.columns: combined["model"] = "SolarSDE"
     t1 = combined[combined["horizon_min"] == 10]
     t1.to_csv(RESULTS_DIR / "paper_table1_main.csv", index=False)
     print("\\n=== PAPER TABLE 1 — main results at h=10min ===")

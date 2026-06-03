@@ -36,6 +36,10 @@ import numpy as np, pandas as pd
 
 # torch._dynamo warmup (some Kaggle builds crash on lazy import at optimizer creation)
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+# CUDA_LAUNCH_BLOCKING makes device-side asserts raise at the offending op (not a
+# later CUBLAS call), so a crash is attributed to the real cause and isolated to
+# its own stage instead of surfacing mysteriously downstream.
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 import torch
 try:
     import torch._utils, torch._dynamo  # noqa: F401
@@ -272,40 +276,48 @@ def nb_final():
         ("markdown", "## 10. SkyGPT EXACT BENCHMARK — all variants, identical cloudy test, full 1–30 min band"),
         ("code", _cell("SKYGPT_TRIPLE_BENCHMARK", "SKYGPT_TRIPLE_BENCHMARK_CODE")),
 
-        ("markdown", "## 11. Baselines (persistence, smart-persistence, LSTM, MC-Dropout, CSDI)"),
-        ("code", _cell("BASELINES", "BASELINES_CODE")),
-
-        ("markdown", "## 12. Ablations (champion-matched: closed-form or rollout native)"),
+        # --- OWN-MODEL GPU STAGES FIRST: these only need the trained champion
+        # checkpoint, so they run BEFORE the risky LSTM/CSDI baseline training.
+        # If a baseline later crashes the CUDA context, these are already saved. ---
+        ("markdown", "## 11. Ablations (champion-matched: closed-form or rollout native)"),
         ("code", _cell_raw("ABLATIONS",
+                           "torch.cuda.empty_cache() if torch.cuda.is_available() else None\n"
                            "_abl = ABLATIONS_V2_CODE if globals().get('CHAMPION_SINGLE', 'closedform') == 'closedform' \\\n"
                            "       else ABLATIONS_ROLLOUT_CODE\n"
                            "exec(safe_stage('ABLATIONS', _abl), globals())")),
 
-        ("markdown", "## 13. Stratified eval + Diebold-Mariano significance"),
-        ("code", _cell("STRATIFIED", "STRATIFIED_CODE")),
-
-        ("markdown", "## 14. Leave-one-month-out cross-validation"),
+        ("markdown", "## 12. Leave-one-month-out cross-validation"),
         ("code", _cell("CROSS_VALIDATION", "CROSS_VALIDATION_V2_CODE")),
 
-        ("markdown", "## 15. PIT / reliability + bootstrap CIs"),
-        ("code", _cell("PIT_RELIABILITY", "PIT_RELIABILITY_CODE")),
-        ("code", _cell("BOOTSTRAP_CIS", "BOOTSTRAP_CIS_CODE")),
-
-        ("markdown", "## 16. Ramp AUROC + CTI physical validation"),
-        ("code", _cell("RAMP_AUROC", "RAMP_AUROC_CODE")),
-        ("code", _cell("CTI_VALIDATION", "CTI_VALIDATION_CODE")),
-
-        ("markdown", "## 17. Multi-level reliability + sampling efficiency + computational cost"),
-        ("code", _cell("RELIABILITY_LEVELS", "RELIABILITY_LEVELS_CODE")),
+        ("markdown", "## 13. Sampling efficiency + computational cost"),
         ("code", _cell("SAMPLING_EFFICIENCY", "SAMPLING_EFFICIENCY_CODE")),
         ("code", _cell("COMPUTATIONAL_COST", "COMPUTATIONAL_COST_CODE")),
 
+        # --- CPU / saved-prediction stages (immune to a poisoned CUDA context) ---
+        ("markdown", "## 14. Stratified eval + Diebold-Mariano significance"),
+        ("code", _cell("STRATIFIED", "STRATIFIED_CODE")),
+        ("markdown", "## 15. PIT / reliability + bootstrap CIs"),
+        ("code", _cell("PIT_RELIABILITY", "PIT_RELIABILITY_CODE")),
+        ("code", _cell("BOOTSTRAP_CIS", "BOOTSTRAP_CIS_CODE")),
+        ("markdown", "## 16. Ramp AUROC + CTI physical validation"),
+        ("code", _cell("RAMP_AUROC", "RAMP_AUROC_CODE")),
+        ("code", _cell("CTI_VALIDATION", "CTI_VALIDATION_CODE")),
+        ("markdown", "## 17. Multi-level reliability"),
+        ("code", _cell("RELIABILITY_LEVELS", "RELIABILITY_LEVELS_CODE")),
         ("markdown", "## 18. Holm-Bonferroni + CAISO economics + sensitivity"),
         ("code", _cell("HOLM_BONFERRONI", "HOLM_BONFERRONI_CODE")),
         ("code", _cell("ECONOMIC_CAISO", "ECONOMIC_CAISO_CODE")),
         ("code", _cell("ECONOMIC_SENSITIVITY", "ECONOMIC_SENSITIVITY_CODE")),
 
-        ("markdown", "## 19. Analysis figures + LaTeX tables"),
+        # --- BASELINES LAST among training: the LSTM/CSDI baselines are the
+        # riskiest training code; running them last means a crash can't take
+        # down any of our own-model results above. ---
+        ("markdown", "## 19. Baselines (persistence, smart-persistence, LSTM, MC-Dropout, CSDI)"),
+        ("code", _cell_raw("BASELINES",
+                           "torch.cuda.empty_cache() if torch.cuda.is_available() else None\n"
+                           "exec(safe_stage('BASELINES', BASELINES_CODE), globals())")),
+
+        ("markdown", "## 20. Analysis figures + LaTeX tables"),
         ("code", _cell("ANALYSIS", "ANALYSIS_CODE")),
         ("code", _cell("LATEX_TABLES", "LATEX_TABLES_CODE")),
 
