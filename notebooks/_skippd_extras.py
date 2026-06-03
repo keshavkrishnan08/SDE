@@ -53,8 +53,10 @@ _add("split", "chronological 70/15/15 by day (no shuffle, no leakage)")
 _add("horizons_min", str(list(HORIZON_MIN.values())))
 _add("mc_samples", N_SAMPLES)
 
-# Model hyperparameters (TemporalLatentSDE)
-_add("arch", "Transformer encoder (2 layers, d=128, 4 heads) over 30-step history "
+# Model hyperparameters (TemporalLatentSDE) — read the ACTUAL history length so
+# the reproducibility table never contradicts the seq_len row.
+_seqlen = int(globals().get("SEQ_LEN", 16))
+_add("arch", f"Transformer encoder (2 layers, d=128, 4 heads) over {_seqlen}-step history "
              "+ Mixture-of-3 Ornstein-Uhlenbeck closed-form marginals "
              "+ learnable persistence-blend + Mondrian conformal calibration")
 _add("z_dim", Z_DIM); _add("c_dim", C_DIM); _add("seq_len", int(globals().get("SEQ_LEN", 30)))
