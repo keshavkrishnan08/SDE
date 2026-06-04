@@ -99,18 +99,31 @@ except Exception:
     import subprocess as _sp; _sp.run([sys.executable, "-m", "pip", "install", "-q", "opencv-python-headless"]); import cv2 as _cv2
 _mn_path = CHECKPOINT_DIR / "motion_norm.npy"
 if _mn_path.exists():
-    _MMU, _MSD = np.load(_mn_path)
+    _MMU, _MSD = np.load(_mn_path); _MDIM = len(_MMU)
 else:
-    _MMU, _MSD = np.zeros(4, np.float32), np.ones(4, np.float32)
+    _MMU, _MSD = np.zeros(4, np.float32), np.ones(4, np.float32); _MDIM = 4
+# infer the motion grid the pipeline used from the descriptor length (4 -> global,
+# else 3*G*G -> GxG grid). Guarantees the eval motion features match training.
+_MGRID = 1 if _MDIM == 4 else int(round((_MDIM / 3) ** 0.5))
 _Hs = 64; _cyx = _Hs // 2; _r2s = (_Hs // 4) ** 2
 _yy2, _xx2 = np.ogrid[:_Hs, :_Hs]; _sunm = ((_yy2 - _cyx) ** 2 + (_xx2 - _cyx) ** 2) <= _r2s
-Mlog = np.zeros((N_SKY, 16, 4), np.float32)
+def _mdesc(dx, dy, mag):
+    if _MGRID <= 1:
+        return [dx.mean(), dy.mean(), mag.mean(), mag[_sunm].mean()]
+    out = []
+    for gy in range(_MGRID):
+        ys = slice(gy*_Hs//_MGRID, (gy+1)*_Hs//_MGRID)
+        for gx in range(_MGRID):
+            xs = slice(gx*_Hs//_MGRID, (gx+1)*_Hs//_MGRID)
+            out += [float(dx[ys,xs].mean()), float(dy[ys,xs].mean()), float(mag[ys,xs].mean())]
+    return out
+Mlog = np.zeros((N_SKY, 16, _MDIM), np.float32)
 for i in range(N_SKY):
     gs = [_cv2.cvtColor(imgs_log[i, j], _cv2.COLOR_RGB2GRAY) for j in range(16)]
     for j in range(1, 16):
         f = _cv2.calcOpticalFlowFarneback(gs[j-1], gs[j], None, 0.5, 3, 9, 3, 5, 1.2, 0)
         dx, dy = f[..., 0], f[..., 1]; mag = np.sqrt(dx*dx + dy*dy)
-        Mlog[i, j] = [dx.mean(), dy.mean(), mag.mean(), mag[_sunm].mean()]
+        Mlog[i, j] = _mdesc(dx, dy, mag)
 Mlog = ((Mlog - _MMU) / _MSD).astype(np.float32)   # normalize with training stats
 
 def _build_cov(ft, cs, motion):

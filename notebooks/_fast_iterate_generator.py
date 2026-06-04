@@ -66,7 +66,13 @@ ARCH = "base"              # which architecture to train + benchmark on SkyGPT.
                            #   wide   K=4 d=256 L=2  (wider transformer)
                            #   deep   K=4 d=128 L=4  (deeper transformer)
                            #   gru    GRU encoder    (different temporal bias)
-                           # Change ARCH, re-run -> see its SkyGPT h= numbers.
+MOTION_GRID = 1            # SPATIAL cloud-motion features (the real beat-attempt):
+                           #   1 = global-mean optical flow (4 dims, current)
+                           #   3 = 3x3 grid-pooled flow (27 dims) — keeps WHERE clouds
+                           #       move toward the sun, the spatial signal SkyGPT uses
+                           #   4 = 4x4 grid (48 dims)
+                           # Sweep ARCH x MOTION_GRID; if a combo beats 2.81 at h=15,
+                           # set the same knobs in notebook 11 for the final paper run.
 SEED_ENSEMBLE     = 1      # >1 = deep ensemble: train this many closed-form models
                            # with different seeds and pool their samples. The one
                            # legitimate lever with a real shot at beating SkyGPT

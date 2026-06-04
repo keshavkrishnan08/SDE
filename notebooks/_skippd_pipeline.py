@@ -212,20 +212,35 @@ try:
     import cv2 as _cv2
 except Exception:
     import subprocess as _sp; _sp.run([sys.executable, "-m", "pip", "install", "-q", "opencv-python-headless"]); import cv2 as _cv2
-MOTION_DIM = 4
+# MOTION_GRID: 1 = global-mean flow (4-dim, default). G>1 = GxG grid-pooled flow
+# (3*G*G dims) that KEEPS where clouds move toward the sun — the spatial signal a
+# global mean throws away. Set MOTION_GRID=3 or 4 in notebook 12 to test it.
+MOTION_GRID = int(globals().get("MOTION_GRID", 1))
+_H = 64; _cy, _cx = _H // 2, _H // 2; _r2 = (_H // 4) ** 2
+_yy, _xx = np.ogrid[:_H, :_H]; _sun = ((_yy - _cy) ** 2 + (_xx - _cx) ** 2) <= _r2
+def _motion_desc(dx, dy, mag):
+    if MOTION_GRID <= 1:
+        return [dx.mean(), dy.mean(), mag.mean(), mag[_sun].mean()]
+    out = []
+    for gy in range(MOTION_GRID):
+        ys = slice(gy * _H // MOTION_GRID, (gy + 1) * _H // MOTION_GRID)
+        for gx in range(MOTION_GRID):
+            xs = slice(gx * _H // MOTION_GRID, (gx + 1) * _H // MOTION_GRID)
+            out += [float(dx[ys, xs].mean()), float(dy[ys, xs].mean()), float(mag[ys, xs].mean())]
+    return out
+MOTION_DIM = 4 if MOTION_GRID <= 1 else 3 * MOTION_GRID * MOTION_GRID
+print(f"  motion descriptor: MOTION_GRID={MOTION_GRID} -> {MOTION_DIM} dims")
 mot_all = np.zeros((len(ds_all), MOTION_DIM), np.float32)
 _dates = img_df["date"].values
 _byte_list = list(img_df["image"].values)
 _prev_g = None; _prev_d = None
-_H = 64; _cy, _cx = _H // 2, _H // 2; _r2 = (_H // 4) ** 2   # central "sun region"
-_yy, _xx = np.ogrid[:_H, :_H]; _sun = ((_yy - _cy) ** 2 + (_xx - _cx) ** 2) <= _r2
 for _i in tqdm(range(len(_byte_list)), desc="  flow"):
     rec = _byte_list[_i]; raw = rec["bytes"] if isinstance(rec, dict) else rec
     g = np.asarray(_PILImage.open(_io.BytesIO(raw)).convert("L"), dtype=np.uint8)
     if _prev_g is not None and _dates[_i] == _prev_d:
         f = _cv2.calcOpticalFlowFarneback(_prev_g, g, None, 0.5, 3, 9, 3, 5, 1.2, 0)
         dx, dy = f[..., 0], f[..., 1]; mag = np.sqrt(dx * dx + dy * dy)
-        mot_all[_i] = [dx.mean(), dy.mean(), mag.mean(), mag[_sun].mean()]
+        mot_all[_i] = _motion_desc(dx, dy, mag)
     _prev_g = g; _prev_d = _dates[_i]
 # robust per-channel normalization (store stats so SkyGPT eval matches)
 MOTION_MU = mot_all.mean(0); MOTION_SD = mot_all.std(0) + 1e-6
