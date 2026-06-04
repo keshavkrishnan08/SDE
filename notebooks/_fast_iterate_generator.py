@@ -59,6 +59,11 @@ Z_DIM = 64
 SKIPPD_VAE_EPOCHS = 12     # CS-VAE (cached after first run if you attach outputs)
 CLOSEDFORM_EPOCHS = 60     # the knob you'll mostly tune
 TRAIN_ROLLOUT     = False  # set True to also train + ensemble the rollout variant
+SEED_ENSEMBLE     = 1      # >1 = deep ensemble: train this many closed-form models
+                           # with different seeds and pool their samples. The one
+                           # legitimate lever with a real shot at beating SkyGPT
+                           # (deep ensembles reliably cut CRPS ~5-12%). Costs
+                           # SEED_ENSEMBLE x ~85 min — set 3 when you want the real try.
 
 # Reuse a cached VAE/latents from an attached Kaggle dataset to skip ~25 min.
 if IN_KAGGLE and Path("/kaggle/input").exists():
@@ -79,6 +84,7 @@ FAST_CLONE_CODE = CLONE_AND_IMPORT_CODE.replace(
     'globals().update(_safe_import("_solarsde_rollout",\n'
     '    ["ROLLOUT_ARCH_CODE"]))\n'
     'globals().update(_safe_import("_skygpt_eval", ["SKYGPT_BENCHMARK_CODE"]))\n'
+    'globals().update(_safe_import("_skygpt_sweep", ["SKYGPT_SWEEP_CODE", "DEEP_ENSEMBLE_CODE"]))\n'
     'globals().update(_safe_import("_ensemble_eval",\n'
     '    ["STASH_CLOSEDFORM_CODE", "STASH_ROLLOUT_CODE", "CHAMPION_SELECT_CODE",\n'
     '     "SKYGPT_TRIPLE_BENCHMARK_CODE"]))')
@@ -133,13 +139,19 @@ def nb_fast():
                            "    exec(safe_stage('STASH_ROLLOUT', STASH_ROLLOUT_CODE), globals())\n"
                            "    exec(safe_stage('CHAMPION_SELECT', CHAMPION_SELECT_CODE), globals())")),
 
+        ("markdown", "## 8b. (optional) Deep ensemble — train K seeds (the real lever; SEED_ENSEMBLE>1)"),
+        ("code", _cell("DEEP_ENSEMBLE", "DEEP_ENSEMBLE_CODE")),
+
         ("markdown", "## 9. SkyGPT exact-benchmark — all horizons + h=15 head-to-head"),
         ("code", _cell_raw("SKYGPT",
-                           "# triple benchmark if rollout was trained, else single-model on the champion\n"
+                           "# triple benchmark if rollout trained, else single-model on the champion\n"
                            "if globals().get('TRAIN_ROLLOUT', False) and (CHECKPOINT_DIR/'mdn_rollout_best.pt').exists():\n"
                            "    exec(safe_stage('SKYGPT', SKYGPT_TRIPLE_BENCHMARK_CODE), globals())\n"
                            "else:\n"
                            "    exec(safe_stage('SKYGPT', SKYGPT_BENCHMARK_CODE), globals())")),
+
+        ("markdown", "## 9b. Idea SWEEP — post-hoc knobs (val-selected + test-oracle diagnostic)"),
+        ("code", _cell("SKYGPT_SWEEP", "SKYGPT_SWEEP_CODE")),
 
         ("markdown", "## 10. Save results"),
         ("code", _cell_raw("SAVE",
