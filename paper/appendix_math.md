@@ -56,7 +56,7 @@ The PV forecast distribution is obtained by the affine map $\hat P_{t+h} = (k_t 
 
 ## A.4 Training objective: closed-form mixture CRPS
 
-We train by minimizing the **Continuous Ranked Probability Score** of the blended mixture against the realized $\delta k_{t+h}$. For a single Gaussian $\mathcal{N}(\mu,\sigma)$ and observation $y$, CRPS has the closed form
+We train by minimizing the **Continuous Ranked Probability Score** of the blended $(K{+}1)$-component mixture against the realized $\delta k_{t+h}$, where the persistence atom $\mathcal{N}(0,\sigma_{\text{pers}}^2)$ is treated as component $0$ with weight $\pi_0 = 1-w$ and the OU atoms have weights $\pi_k = w\,\tilde\pi_k$ ($k=1,\dots,K$). All sums below run over the full index set $\{0,1,\dots,K\}$. For a single Gaussian $\mathcal{N}(\mu,\sigma)$ and observation $y$, CRPS has the closed form
 $$
 \mathrm{CRPS}\big(\mathcal{N}(\mu,\sigma),y\big) = \sigma\left[\,\frac{y-\mu}{\sigma}\big(2\Phi(\tfrac{y-\mu}{\sigma})-1\big) + 2\varphi(\tfrac{y-\mu}{\sigma}) - \tfrac{1}{\sqrt{\pi}}\,\right],
 $$
@@ -64,15 +64,21 @@ with $\varphi,\Phi$ the standard normal pdf/cdf. For a mixture $\sum_k \pi_k \ma
 $$
 \mathrm{CRPS} = \sum_k \pi_k\, \mathbb{E}\,|X_k - y| \;-\; \tfrac{1}{2}\sum_{k}\sum_{l}\pi_k\pi_l\, \mathbb{E}\,|X_k - X_l|,
 $$
-where $\mathbb{E}|X_k-y| = \sigma_k\, A\!\big(\tfrac{y-\mu_k}{\sigma_k}\big)$ with $A(z)=2\varphi(z)+z(2\Phi(z)-1)$, and $\mathbb{E}|X_k - X_l| = \sqrt{\sigma_k^2+\sigma_l^2}\, A\!\big(\tfrac{\mu_k-\mu_l}{\sqrt{\sigma_k^2+\sigma_l^2}}\big)$ since $X_k-X_l\sim\mathcal{N}(\mu_k-\mu_l,\sigma_k^2+\sigma_l^2)$. This objective is **fully differentiable** through $\pi,\mu,\sigma$ and the blend weight $w$ — no sampling-based gradient estimator is needed, which is what lets the persistence-blend weight train stably.
+where $\mathbb{E}|X_k-y| = \sigma_k\, A\!\big(\tfrac{y-\mu_k}{\sigma_k}\big)$ with $A(z)=2\varphi(z)+z(2\Phi(z)-1)$, and $\mathbb{E}|X_k - X_l| = \sqrt{\sigma_k^2+\sigma_l^2}\, A\!\big(\tfrac{\mu_k-\mu_l}{\sqrt{\sigma_k^2+\sigma_l^2}}\big)$ since $X_k-X_l\sim\mathcal{N}(\mu_k-\mu_l,\sigma_k^2+\sigma_l^2)$. Because the index set includes the persistence atom, the cross terms $\mathbb{E}|X_0-X_l|$ (persistence $\times$ OU) are present in the double sum, so the objective scores the *blended* law, not the OU mixture alone. It is **fully differentiable** through $\pi,\mu,\sigma$ and the blend weight $w$ — no sampling-based gradient estimator is needed, which is what lets the persistence-blend weight train stably.
+
+**Relation of the training loss to the reported metric.** Training minimizes CRPS in clear-sky-index ($\delta k$) units. Evaluation reports CRPS in PV-power (kW). Since the map $\delta k \mapsto P=(k_t+\delta k)\,C(m_{t+h},\tau_{t+h})$ is affine with a per-sample positive scale $C$, CRPS transforms pointwise as $\mathrm{CRPS}_P = C\,\mathrm{CRPS}_{\delta k}$. The two objectives therefore differ by the heteroscedastic factor $C$; we report this explicitly because the model is trained on the unit-less score and evaluated on the kW score.
 
 ## A.5 Mondrian (group-conditional) conformal calibration
 
-After training, we calibrate predictive coverage directly on the validation set, **per (horizon, CTI-quartile) cell** — split-conformal restricted to a partition (Mondrian conformal prediction; Vovk et al.). For each cell, we search the multiplicative scale $s_h$ over a grid that **minimizes validation CRPS subject to a coverage floor** (empirical $90\%$-PI coverage $\ge 0.88$):
+After training we calibrate coverage by **genuine split-conformal prediction restricted to a partition** (Mondrian conformal; Vovk et al., 2005). The partition is the grid of (horizon $h$, CTI-quartile $q$) cells. For a target level $1-\alpha$ we use the standardized absolute residual as the nonconformity score, $R_i = |y_i - \hat\mu_i| / \hat\sigma_i$, computed on the validation set. Within each cell of $n$ calibration points the conformal scale is the finite-sample-inflated empirical quantile
 $$
-s_h^\star = \arg\min_{s}\ \widehat{\mathrm{CRPS}}_{\text{val}}(s) \quad \text{s.t.}\quad \widehat{\mathrm{PICP}}_{\text{val}}(s) \ge 0.88 .
+s_{h,q}(\alpha) = \frac{\widehat{Q}_{\lceil (n+1)(1-\alpha)\rceil / n}\big(\{R_i\}_{i\in \text{cell}}\big)}{\Phi^{-1}(1-\alpha/2)},
 $$
-This calibrates the *reported metric* (CRPS) rather than assuming Gaussianity, and yields the per-cell scales $s_h = s_{\text{base}}(h)\cdot s_{\text{CTI}}(h, q)$. Because conditioning is on a finite partition, the split-conformal marginal coverage guarantee holds within each cell up to the cell sample size.
+and the calibrated interval at a test point in that cell is $[\hat\mu \mp \Phi^{-1}(1-\alpha/2)\,s_{h,q}\,\hat\sigma]$. Under exchangeability within a cell, split-conformal guarantees the finite-sample marginal coverage bound
+$$
+\mathbb{P}\big(y_{\text{test}}\in [\hat\mu \mp \Phi^{-1}(1-\alpha/2)\,s_{h,q}\,\hat\sigma]\big) \ge 1-\alpha
+$$
+*conditional on the cell*, provided $n \ge \lceil (n+1)(1-\alpha)\rceil$; for cells with insufficient calibration samples (notably the high-CTI tail) the scale defaults to $1$ and the guarantee degrades gracefully to the model's nominal coverage. Crucially, the scale is a **quantile of held-out nonconformity scores — not a CRPS-minimizing search on validation** — so the reported test CRPS and coverage are computed on data untouched by calibration, avoiding metric double-dipping. We report test-set PICP at multiple nominal levels $\{0.5,0.7,0.8,0.9,0.95\}$ (Appendix B) to substantiate the coverage claim across the calibration curve, not at $90\%$ alone.
 
 ## A.6 Evaluation metrics (formal)
 
