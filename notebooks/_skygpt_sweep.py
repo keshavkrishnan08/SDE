@@ -55,8 +55,9 @@ _ctiscale=float(globals().get("_cti_scale",1.0)) or 1.0
 # VAE + motion features (identical to training pipeline)
 SEQ=16
 _vae=SkippdVAE(64).to(DEVICE); _vae.load_state_dict(torch.load(CHECKPOINT_DIR/"skippd_vae.pt",map_location=DEVICE)); _vae.eval()
-_sde=ClosedFormSDE(z_dim=Z_DIM,c_dim=C_DIM,n_components=3,seq_len=SEQ,d_model=128,n_heads=4,n_layers=2,
-                   n_horizons=len(HORIZON_MIN)).to(DEVICE)
+_sde=(build_sde_model(SEQ) if "build_sde_model" in globals()
+      else ClosedFormSDE(z_dim=Z_DIM,c_dim=C_DIM,n_components=3,seq_len=SEQ,d_model=128,n_heads=4,n_layers=2,
+                         n_horizons=len(HORIZON_MIN)).to(DEVICE))
 _sde.load_state_dict(torch.load(CHECKPOINT_DIR/"mdn_v2_best.pt",map_location=DEVICE)); _sde.eval()
 print("  encoding log frames + motion ...")
 _flat=imgs_log.reshape(-1,64,64,3); _Zlog=np.zeros((len(_flat),64),np.float32)

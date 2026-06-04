@@ -72,9 +72,13 @@ _ctiscale = float(globals().get("_cti_scale", 1.0)) or 1.0
 SEQ = 16
 _vae = SkippdVAE(64).to(DEVICE)
 _vae.load_state_dict(torch.load(CHECKPOINT_DIR / "skippd_vae.pt", map_location=DEVICE)); _vae.eval()
-_sde = TemporalLatentSDE(z_dim=Z_DIM, c_dim=C_DIM, n_components=3, seq_len=SEQ,
-                         d_model=128, n_heads=4, n_layers=2,
-                         n_horizons=len(HORIZON_MIN)).to(DEVICE)
+# use the arch factory if present (notebook 12 arch variants), else default dims
+if "build_sde_model" in globals():
+    _sde = build_sde_model(SEQ)
+else:
+    _sde = TemporalLatentSDE(z_dim=Z_DIM, c_dim=C_DIM, n_components=3, seq_len=SEQ,
+                             d_model=128, n_heads=4, n_layers=2,
+                             n_horizons=len(HORIZON_MIN)).to(DEVICE)
 _sde.load_state_dict(torch.load(CHECKPOINT_DIR / "mdn_v2_best.pt", map_location=DEVICE)); _sde.eval()
 
 # --- encode all 16 log frames per window -> Zlog (N,16,64) ---

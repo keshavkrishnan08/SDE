@@ -442,10 +442,18 @@ else:
     va_dl = DataLoader(va_ds, batch_size=128, shuffle=False, num_workers=0)
 
     # ----- (c) Build + train the SDE -----
+    # Architecture hyperparameters are read from globals so notebook 12 can sweep
+    # variants (different capacity / mixture count) without editing this code.
     torch.manual_seed(42); np.random.seed(42)
-    sde = TemporalLatentSDE(z_dim=Z_DIM, c_dim=C_DIM, n_components=3,
-                            seq_len=SEQ_LEN, d_model=128, n_heads=4, n_layers=2,
-                            n_horizons=len(HORIZON_STEPS_TABLE)).to(DEVICE)
+    _ARCH_D     = int(globals().get("ARCH_D_MODEL", 128))
+    _ARCH_K     = int(globals().get("ARCH_N_COMPONENTS", 3))
+    _ARCH_L     = int(globals().get("ARCH_N_LAYERS", 2))
+    _ARCH_HEADS = int(globals().get("ARCH_N_HEADS", 4))
+    # use the selected encoder class (notebook 12 may pick a GRU variant)
+    _SDE_CLS = globals().get("TemporalLatentSDE_SELECTED", TemporalLatentSDE)
+    sde = _SDE_CLS(z_dim=Z_DIM, c_dim=C_DIM, n_components=_ARCH_K,
+                   seq_len=SEQ_LEN, d_model=_ARCH_D, n_heads=_ARCH_HEADS, n_layers=_ARCH_L,
+                   n_horizons=len(HORIZON_STEPS_TABLE)).to(DEVICE)
     # Bake sigma_pers into the model so inference is self-contained
     with torch.no_grad():
         sde.sigma_pers_table.copy_(sigma_pers_tensor.to(DEVICE))

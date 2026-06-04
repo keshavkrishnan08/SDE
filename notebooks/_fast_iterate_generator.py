@@ -59,6 +59,14 @@ Z_DIM = 64
 SKIPPD_VAE_EPOCHS = 12     # CS-VAE (cached after first run if you attach outputs)
 CLOSEDFORM_EPOCHS = 60     # the knob you'll mostly tune
 TRAIN_ROLLOUT     = False  # set True to also train + ensemble the rollout variant
+ARCH = "base"              # which architecture to train + benchmark on SkyGPT.
+                           # Options: base | bigmix | wide | deep | gru
+                           #   base   K=3 d=128 L=2  (reference closed-form)
+                           #   bigmix K=8 d=128 L=3  (heavy-tail mixture for cloudy ramps)
+                           #   wide   K=4 d=256 L=2  (wider transformer)
+                           #   deep   K=4 d=128 L=4  (deeper transformer)
+                           #   gru    GRU encoder    (different temporal bias)
+                           # Change ARCH, re-run -> see its SkyGPT h= numbers.
 SEED_ENSEMBLE     = 1      # >1 = deep ensemble: train this many closed-form models
                            # with different seeds and pool their samples. The one
                            # legitimate lever with a real shot at beating SkyGPT
@@ -85,6 +93,7 @@ FAST_CLONE_CODE = CLONE_AND_IMPORT_CODE.replace(
     '    ["ROLLOUT_ARCH_CODE"]))\n'
     'globals().update(_safe_import("_skygpt_eval", ["SKYGPT_BENCHMARK_CODE"]))\n'
     'globals().update(_safe_import("_skygpt_sweep", ["SKYGPT_SWEEP_CODE", "DEEP_ENSEMBLE_CODE"]))\n'
+    'globals().update(_safe_import("_arch_variants", ["ARCH_VARIANTS_CODE"]))\n'
     'globals().update(_safe_import("_ensemble_eval",\n'
     '    ["STASH_CLOSEDFORM_CODE", "STASH_ROLLOUT_CODE", "CHAMPION_SELECT_CODE",\n'
     '     "SKYGPT_TRIPLE_BENCHMARK_CODE"]))')
@@ -119,9 +128,13 @@ def nb_fast():
         ("code", _cell("LOAD_DATA", "LOAD_DATA_TOLERANT_CODE")),
         ("code", _cell("HORIZON_OVERRIDE", "SKIPPD_HORIZON_OVERRIDE_CODE")),
 
-        ("markdown", "## 7. Closed-form architecture + train (all-weather per-horizon prints here)"),
+        ("markdown", "## 7. Architecture (select via ARCH) + train (all-weather per-horizon prints here)"),
         ("code", _cell("CLOSEDFORM_ARCH", "MDN_ARCHITECTURE_CODE")),
-        ("code", _cell_raw("CLOSEDFORM_GLUE", "ClosedFormSDE = TemporalLatentSDE\nprint('ClosedFormSDE alias saved.')")),
+        ("code", _cell("ARCH_SELECT", "ARCH_VARIANTS_CODE")),
+        ("code", _cell_raw("CLOSEDFORM_GLUE",
+                           "# ClosedFormSDE is set by ARCH_SELECT; fall back to base if that stage was skipped\n"
+                           "if 'ClosedFormSDE' not in globals(): ClosedFormSDE = TemporalLatentSDE\n"
+                           "print('arch ready:', globals().get('ARCH','base'))")),
         ("code", _cell_raw("CLOSEDFORM_TRAIN",
                            "exec(safe_stage('STAGE0_CLOSEDFORM',\n"
                            "     STAGE_0_V2_CODE.replace('EPOCHS = 60', f'EPOCHS = {CLOSEDFORM_EPOCHS}')), globals())")),
