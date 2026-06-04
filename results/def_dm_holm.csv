@@ -1,0 +1,13 @@
+horizon_min,vs,mean_crps_diff,hac_dm,p_value,ours_better,holm_reject_05
+1,persistence,-0.0303,-15.624,0.0,True,True
+1,smart,-0.0356,-18.426,0.0,True,True
+5,persistence,-0.1196,-14.948,0.0,True,True
+5,smart,-0.0669,-8.948,0.0,True,True
+10,persistence,-0.2421,-14.234,0.0,True,True
+10,smart,-0.0846,-5.454,0.0,True,True
+15,persistence,-0.3714,-13.826,0.0,True,True
+15,smart,-0.0843,-3.884,0.000105,True,True
+20,persistence,-0.5093,-13.423,0.0,True,True
+20,smart,-0.0858,-2.888,0.003902,True,True
+30,persistence,-0.8334,-13.831,0.0,True,True
+30,smart,-0.1223,-2.792,0.005265,True,True
