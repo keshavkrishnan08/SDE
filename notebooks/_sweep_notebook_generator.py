@@ -56,9 +56,14 @@ for d in [DATA_DIR, CHECKPOINT_DIR, RESULTS_DIR, LATENT_DIR, SPLITS_DIR, EXTENDE
     d.mkdir(parents=True, exist_ok=True)
 
 # ===== The sweep =====
+# NOTE: MOTION_GRID=3 (spatial flow) was tested and HURT (base 3.03 -> 3.63 at
+# h=15) — noisy on 64x64 frames. The bigmix head helped though. So the next sweep
+# tests the head variants at the GOOD motion setting (grid=1). bigmix+grid1 is the
+# most promising untested config.
 SWEEP_CONFIGS = [
-    ("base",   3),   # spatial motion alone
-    ("bigmix", 3),   # spatial motion + heavy-tail mixture head
+    ("bigmix", 1),   # heavy-tail 8-component mixture (helped at grid3; test at good grid)
+    ("wide",   1),   # wider transformer (d=256)
+    ("deep",   1),   # deeper transformer (4 layers)
 ]
 Z_DIM = 64
 SKIPPD_VAE_EPOCHS = 12
